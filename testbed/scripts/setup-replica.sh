@@ -13,12 +13,26 @@ if [ "$running" = "ON" ]; then
   exit 0
 fi
 
-"${COMPOSE[@]}" exec -T mysql84-replica mysql -uroot -prootpass -e "
-  STOP REPLICA;
-  CHANGE REPLICATION SOURCE TO
-    SOURCE_HOST='mysql84', SOURCE_USER='repl', SOURCE_PASSWORD='replpass',
-    SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
-  START REPLICA;" 2>/dev/null
+# Retry: right after "healthy" the entrypoint may still be swapping its
+# temporary init server for the real one; a one-shot exec here dies silently
+# under set -e with stderr discarded (bit us on a fast CI runner).
+wired=0
+for i in $(seq 1 10); do
+  if "${COMPOSE[@]}" exec -T mysql84-replica mysql -uroot -prootpass -e "
+    STOP REPLICA;
+    CHANGE REPLICATION SOURCE TO
+      SOURCE_HOST='mysql84', SOURCE_USER='repl', SOURCE_PASSWORD='replpass',
+      SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;
+    START REPLICA;" 2>/dev/null; then
+    wired=1
+    break
+  fi
+  sleep 2
+done
+if [ "$wired" -ne 1 ]; then
+  echo "ERROR: CHANGE REPLICATION SOURCE kept failing on mysql84-replica" >&2
+  exit 1
+fi
 
 # Wait until the SQL thread is running and the replicated mon user has arrived
 for i in $(seq 1 30); do

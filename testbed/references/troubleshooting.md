@@ -24,11 +24,17 @@ DBD::mysql 5.x (build from CPAN) or TLS.
 - setup-replica.sh polls for the replicated mon user as its readiness signal.
 
 ## Healthcheck false positives
-`mysqladmin ping` can succeed against the image's temporary init server
-before the real server is up. The compose healthchecks use
-`start_period: 25s` + retries to ride that out; `up --wait` blocks on healthy.
-MariaDB images ship `healthcheck.sh --connect --innodb_initialized`, which
-doesn't have this problem.
+`mysqladmin ping` over the socket can succeed against the image's temporary
+init server before the real server is up — and `start_period` does NOT help:
+it only suppresses failure counting, a success during it still flips the
+container healthy immediately. Confirmed on a GitHub Actions runner: the
+replica went "healthy" against the temp server and setup-replica.sh's
+CHANGE REPLICATION SOURCE hit the temp→real swap and died. Two-layer fix:
+the compose healthcheck pings `-h127.0.0.1` (TCP — the temp server is
+socket-only, so it can't false-positive), and setup-replica.sh retries the
+CHANGE block instead of one-shotting it. MariaDB images ship
+`healthcheck.sh --connect --innodb_initialized`, which doesn't have this
+problem.
 
 ## Runner containers can't reach the repo
 The repo is mounted read-only at /mytop-repo via a relative path in

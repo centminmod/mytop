@@ -5,8 +5,12 @@ name: mytop-testbed
 # behind the "full" profile. Repo is mounted read-only into runners at
 # /mytop-repo so code edits on the host are immediately testable.
 
+# -h127.0.0.1 forces TCP: the mysql image's temporary init server is
+# socket-only, so a socket ping can flip the container healthy before the real
+# server listens (start_period does NOT delay the healthy transition — CI
+# runners are fast enough to hit that window and race setup-replica.sh).
 x-mysql-common: &mysql-healthcheck
-  test: ["CMD", "mysqladmin", "ping", "-uroot", "-prootpass"]
+  test: ["CMD", "mysqladmin", "ping", "-h127.0.0.1", "-uroot", "-prootpass"]
   interval: 3s
   timeout: 3s
   retries: 20
