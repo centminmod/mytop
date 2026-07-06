@@ -1,30 +1,159 @@
 #!/usr/bin/perl -w
+
+# /**
+#  * @version    2.1
+#  * @package    mytop
+#  * @author     Fotis Evangelou - originally by Jeremy Zawodny & Mark Grennan
+#  * @url        https://github.com/fevangelou/mytop
+#  * @copyright  Copyright (c) 2000 - 2007 Jeremy D. Zawodny, (c) 2010 - 2025 Mark Grennan, (c) 2026+ Fotis Evangelou
+#  * @license    GNU/GPL
+#  */
+
+# --- CHANGELOG ---
+# v2.1 - Jul 5th, 2026:
+# - Dual DBD driver support: use DBD::mysql if present, fall back to DBD::MariaDB
+#   (fixes systems using MariaDB.org/cPanel repos on RHEL 9+, where perl-DBD-MySQL's
+#   mysql-common dependency conflicts with MariaDB-common, and DBD::mysql 5.x no
+#   longer compiles against MariaDB's client library)
+# - Dependency checker now detects the MariaDB-common conflict on RHEL-family systems
+#   and suggests the correct CPAN-based fix instead of a dnf command that will fail
+# - Strip stray non-printing control bytes (e.g. embedded ESC sequences) from displayed
+#   query text so they can't corrupt or inject escape sequences into the terminal
+# - Fixed connection failure under DBD::MariaDB when host is "localhost": the DSN no
+#   longer sends a port alongside it, since DBD::MariaDB (unlike DBD::mysql) rejects
+#   that combination outright ("port cannot be specified when host is localhost or
+#   embedded"). Only affects systems using the DBD::MariaDB fallback.
+# - Default password is now undef instead of '', so an unset password properly defers
+#   to ~/.my.cnf (e.g. /root/.my.cnf on cPanel/RHEL boxes) instead of always sending a
+#   literal blank password that overrides it and gets rejected with "Access denied
+#   for user 'root'@'localhost' (using password: NO)"
+# - Load average and uptime in the header are now labeled and separated, e.g.
+#   "Load Avg.: 5.34 (1m) 4.53 (5m) 5.41 (15m) - Uptime: 285 days, 11:08", instead
+#   of dumping the whole raw /proc/loadavg line unlabeled (which also included
+#   running/total process counts and the last PID)
+# - Uptime is now phrased like the classic `uptime` command ("285 days, 11:08" or
+#   "5 min" when under an hour) instead of a raw "D+HH:MM:SS" counter - nobody
+#   needs second-level precision on a duration usually measured in days
+# - Current time is now shown labeled on its own line below load avg/uptime,
+#   e.g. "Current Time: 14:50:16", instead of tacked on unlabeled at the end
+# - Strip the "-MariaDB"/"-log" build suffix from the displayed server version (e.g.
+#   "11.4.12-MariaDB" -> "11.4.12") to avoid the redundant "MariaDB ... -MariaDB" title
 #
-# $Id: mytop,v 1.91 2012/01/18 16:49:12 mgrennan Exp $
-
-=pod
-
-=head1 NAME
-
-mytop - display MySQL server performance info like `top'
-
-=cut
-
-## most of the POD is at the bottom of the file
+# v2.0 - Feb 3rd, 2026:
+# - MySQL 8.0+ & MariaDB 10.3+ compatibility patches (EXPLAIN works again, query cache detection fixed, etc.)
+# - Added helpful error message if DBI/DBD::mysql modules are missing
+# - Better defaults out-of-the-box
+# - No need to run make & make install - just copy the mytop script into /usr/local/bin and make it executable.
 
 use 5.005;
 use strict;
-use DBI;
+
+## Which DBD driver we ended up using ('mysql' or 'MariaDB') - set in the BEGIN
+## block below and used later on to build the DSN and connection attribute names.
+our $DBI_DRIVER;
+
+## Check for required DBI modules and provide helpful error message
+BEGIN {
+    my @missing_modules;
+
+    eval { require DBI; DBI->import(); 1; } or push @missing_modules, 'DBI';
+
+    ## Prefer DBD::mysql (the common case), fall back to DBD::MariaDB - the
+    ## actively maintained driver built against MariaDB's own client library.
+    ## This matters on RHEL 9+ systems using MariaDB.org/cPanel repos, where
+    ## DBD::mysql 5.x won't compile against MariaDB's connector at all.
+    if ( eval { require DBD::mysql; DBD::mysql->import(); 1; } ) {
+        $DBI_DRIVER = 'mysql';
+    }
+    elsif ( eval { require DBD::MariaDB; DBD::MariaDB->import(); 1; } ) {
+        $DBI_DRIVER = 'MariaDB';
+    }
+    else {
+        push @missing_modules, 'DBD::mysql or DBD::MariaDB';
+    }
+
+    eval { require Term::ReadKey; Term::ReadKey->import(); 1; }
+      or push @missing_modules, 'Term::ReadKey';
+
+    if (@missing_modules) {
+        print STDERR "\nError: Required Perl modules are missing: "
+          . join( ', ', @missing_modules ) . "\n\n";
+
+        # Detect OS family to provide appropriate installation command
+        my $os_family = '';
+        if ( -f "/etc/os-release" ) {
+            if ( open my $fh, '<', '/etc/os-release' ) {
+                my $content = do { local $/; <$fh> };
+                close $fh;
+                if ( $content =~ /^ID(?:_LIKE)?=.*(debian|ubuntu)/im ) {
+                    $os_family = 'debian';
+                }
+                elsif ( $content =~
+                    /^ID(?:_LIKE)?=.*(rhel|centos|fedora|rocky|alma)/im )
+                {
+                    $os_family = 'rhel';
+                }
+            }
+        }
+
+        if ( $os_family eq 'debian' ) {
+            print STDERR "Install the required packages with:\n";
+            print STDERR
+"  sudo apt install libdbi-perl libdbd-mysql-perl libterm-readkey-perl\n\n";
+        }
+        elsif ( $os_family eq 'rhel' ) {
+            print STDERR "Install the required packages with:\n";
+            print STDERR
+              "  sudo yum install perl-DBI perl-DBD-MySQL perl-TermReadKey\n\n";
+            print STDERR "  ~ OR ~\n\n";
+            print STDERR
+              "  sudo dnf install perl-DBI perl-DBD-MySQL perl-TermReadKey\n\n";
+
+        # On MariaDB.org/cPanel repo systems, MariaDB-common conflicts with
+        # mysql-common, so perl-DBD-MySQL can't be installed via dnf/yum at all.
+            my $has_mariadb_common = 0;
+            if ( open my $rpm, '-|', 'rpm -q MariaDB-common 2>/dev/null' ) {
+                my $out = do { local $/; <$rpm> };
+                close $rpm;
+                $has_mariadb_common = 1 if $out =~ /^MariaDB-common-/m;
+            }
+
+            if ($has_mariadb_common) {
+                print STDERR
+"NOTE: This system has MariaDB-common installed (MariaDB.org/cPanel repos), which\n";
+                print STDERR
+"conflicts with perl-DBD-MySQL's mysql-common dependency - the commands above will fail.\n\n";
+                print STDERR "Install the driver via CPAN instead:\n";
+                print STDERR "  sudo cpan DBD::MariaDB\n\n";
+                print STDERR
+"  ~ OR (last release built against MariaDB's client library) ~\n\n";
+                print STDERR
+                  "  sudo cpan -T DVEEDEN/DBD-mysql-4.050.tar.gz\n\n";
+            }
+        }
+        else {
+            print STDERR "Please install the required Perl modules:\n";
+            print STDERR
+"  - On Debian 11/Ubuntu 22.04 or newer releases: sudo apt install libdbi-perl libdbd-mysql-perl libterm-readkey-perl\n";
+            print STDERR
+"  - On RHEL distros including AlmaLinux, CentOS, Fedora & Rocky (from v7 or newer - where applicable): sudo yum install perl-DBI perl-DBD-MySQL perl-TermReadKey\n";
+            print STDERR "  - Via CPAN: cpan DBI DBD::mysql Term::ReadKey\n";
+            print STDERR
+"  - Via CPAN, if the above fails to compile (e.g. MariaDB.org/cPanel repos on RHEL 9+): cpan DBD::MariaDB\n\n";
+        }
+        exit 1;
+    }
+}
+
 use Getopt::Long;
-use DBD::mysql;
 use Socket;
 
-$main::VERSION = "1.91";
+$main::VERSION = "2.1";
 
-$|=1;
+$| = 1;
 $0 = 'mytop';
 
-my $WIN = ($^O eq 'MSWin32') ? 1 : 0;
+my $WIN = ( $^O eq 'MSWin32' ) ? 1 : 0;
 
 ## Test for color support.
 
@@ -44,7 +173,7 @@ my $debug = 0;
 
 ## Try to lower our priority (which, who, pri)
 
-setpriority(0,0,10) unless $WIN;
+setpriority( 0, 0, 10 ) unless $WIN;
 
 ## Prototypes
 
@@ -73,63 +202,61 @@ sub FindProg($);
 ## Default Config Values
 
 my %config = (
-    batchmode     => 0,
-    color         => 1,
-    db            => 'test',
-    delay         => 5,
-    filter_user   => qr/.?/,
-    filter_db     => qr/.?/,
-    filter_host   => qr/.?/,
-    filter_state  => qr/.?/,
-    header        => 1,
-    help          => 0,
-    host          => 'localhost',
-    idle          => 1,
-    long	  => 120,
-    long_nums     => 0,
-    mode          => 'top',
-    prompt        => 0,
-    pass          => '',
-    port          => 3306,
-    resolve       => 0,
-    slow	  => 10,	# slow query time
-    socket        => '',
-    sort          => 1,         # default or reverse sort ("s")
-    user          => 'root'
+    batchmode    => 0,
+    color        => 1,
+    db           => 'mysql',
+    delay        => 1,
+    filter_user  => qr/.?/,
+    filter_db    => qr/.?/,
+    filter_host  => qr/.?/,
+    filter_state => qr/.?/,
+    header       => 1,
+    help         => 0,
+    host         => 'localhost',
+    idle         => 2,
+    long         => 120,
+    long_nums    => 0,
+    mode         => 'top',
+    prompt       => 0,
+    pass         =>
+      undef
+    , # undef (not '') so an unset password defers to ~/.my.cnf, not a literal blank one
+    port    => 3306,
+    resolve => 0,
+    slow    => 10,      # slow query time
+    socket  => '',
+    sort    => 1,       # default or reverse sort ("s")
+    user    => 'root'
 );
 
-my %qcache = ();    ## The query cache--used for full query info support.
-my %ucache = ();    ## The user cache--used for full killing by user
-my %dbcache = ();   ## The db cache.  This should be merged at some point.
-my %statcache = (); ## The show status cache for GetShowStatus()
+my %qcache    = ();    ## The query cache--used for full query info support.
+my %ucache    = ();    ## The user cache--used for full killing by user
+my %dbcache   = ();    ## The db cache.  This should be merged at some point.
+my %statcache = ();    ## The show status cache for GetShowStatus()
 
-my (%STATUS, %OLD_STATUS); # header stuff.
+my ( %STATUS, %OLD_STATUS );    # header stuff.
 
-my $CLEAR = $WIN ? '': `clear`;
+my $CLEAR = $WIN ? '' : `clear`;
 
 ## Term::ReadKey values
 
 my $RM_RESET   = 0;
-my $RM_NOBLKRD = 3; ## using 4 traps Ctrl-C :-(
+my $RM_NOBLKRD = 3;             ## using 4 traps Ctrl-C :-(
 
 ## Read the user's config file, if it exists.
 
 my $config = "$ENV{HOME}/.mytop";
 
-if (-e $config)
-{
-    if (open CFG, "<$config")
-    {
-        while (<CFG>)
-        {
-            next if /^\s*$/;  ## skip blanks
-            next if /^\s*#/;  ## skip comments
+if ( -e $config ) {
+    if ( open CFG, "<$config" ) {
+        while (<CFG>) {
+            next if /^\s*$/;    ## skip blanks
+            next if /^\s*#/;    ## skip comments
 
             chomp;
 
-	    if (/(\S+)\s*=\s*(.*\S)/)
-            {
-                $config{lc $1} = $2 if exists $config{lc $1};
+            if (/(\S+)\s*=\s*(.*\S)/) {
+                $config{ lc $1 } = $2 if exists $config{ lc $1 };
             }
         }
         close CFG;
@@ -140,75 +267,70 @@ if (-e $config)
 
 use vars qw($opt_foo);
 
-Getopt::Long::Configure('no_ignore_case', 'bundling');
+Getopt::Long::Configure( 'no_ignore_case', 'bundling' );
 
 GetOptions(
-    "color!"              => \$config{color},
-    "user|u=s"            => \$config{user},
-    "pass|password|p=s"   => \$config{pass},
-    "database|db|d=s"     => \$config{db},
-    "host|h=s"            => \$config{host},
-    "port|P=i"            => \$config{port},
-    "socket|S=s"          => \$config{socket},
-    "delay|s=i"           => \$config{delay},
-    "batch|batchmode|b"   => \$config{batchmode},
-    "header!"             => \$config{header},
-    "idle|i!"             => \$config{idle},
-    "resolve|r!"          => \$config{resolve},
-    "prompt!"             => \$config{prompt},
-    "long=i"		  => \$config{long},
-    "long_nums!"          => \$config{long_nums},
-    "mode|m=s"            => \$config{mode},
-    "slow=i"		  => \$config{slow},
-    "sort=s"              => \$config{sort}
+    "color!"            => \$config{color},
+    "user|u=s"          => \$config{user},
+    "pass|password|p=s" => \$config{pass},
+    "database|db|d=s"   => \$config{db},
+    "host|h=s"          => \$config{host},
+    "port|P=i"          => \$config{port},
+    "socket|S=s"        => \$config{socket},
+    "delay|s=i"         => \$config{delay},
+    "batch|batchmode|b" => \$config{batchmode},
+    "header!"           => \$config{header},
+    "idle|i!"           => \$config{idle},
+    "resolve|r!"        => \$config{resolve},
+    "prompt!"           => \$config{prompt},
+    "long=i"            => \$config{long},
+    "long_nums!"        => \$config{long_nums},
+    "mode|m=s"          => \$config{mode},
+    "slow=i"            => \$config{slow},
+    "sort=s"            => \$config{sort}
 );
 
 ## User may have put the port with the host.
 
-if ($config{host} =~ s/:(\d+)$//)
-{
+if ( $config{host} =~ s/:(\d+)$// ) {
     $config{port} = $1;
 }
 
 ## Don't use Term::ReadKey unless running interactively.
 
-if (not $config{batchmode})
-{
+if ( not $config{batchmode} ) {
     require Term::ReadKey;
     Term::ReadKey->import();
 }
 
 ## User may want to disable color.
 
-if ($HAS_COLOR and not $config{color})
-{
+if ( $HAS_COLOR and not $config{color} ) {
     $HAS_COLOR = 0;
 }
 
-if ($HAS_COLOR)
-{
+if ($HAS_COLOR) {
     import Term::ANSIColor ':constants';
 }
-else
-{
-    *RESET  = sub { };
-    *YELLOW = sub { };
-    *RED    = sub { };
-    *MAGENTA  = sub { };
-    *GREEN  = sub { };
-    *BLUE   = sub { };
-    *WHITE  = sub { };
-    *BOLD   = sub { };
+else {
+    *RESET   = sub { };
+    *YELLOW  = sub { };
+    *RED     = sub { };
+    *MAGENTA = sub { };
+    *GREEN   = sub { };
+    *BLUE    = sub { };
+    *WHITE   = sub { };
+    *BOLD    = sub { };
 }
 
-my $RESET  = RESET()   || '';
-my $YELLOW = YELLOW()  || '';
-my $RED    = RED()     || '';
-my $MAGENTA  = MAGENTA()   || '';
-my $GREEN  = GREEN()   || '';
-my $BLUE   = BLUE()    || '';
-my $WHITE  = WHITE()   || '';
-my $BOLD   = BOLD()    || '';
+my $RESET   = RESET()   || '';
+my $YELLOW  = YELLOW()  || '';
+my $RED     = RED()     || '';
+my $MAGENTA = MAGENTA() || '';
+my $GREEN   = GREEN()   || '';
+my $BLUE    = BLUE()    || '';
+my $WHITE   = WHITE()   || '';
+my $BOLD    = BOLD()    || '';
 
 ## Connect
 
@@ -216,37 +338,51 @@ my $dsn;
 
 ## Socket takes precedence.
 
-$dsn ="DBI:mysql:database=$config{db};mysql_read_default_group=mytop;";
+## DBD::MariaDB renames all mysql_* connection attributes to mariadb_*.
+my $attr_prefix = ( $DBI_DRIVER eq 'MariaDB' ) ? 'mariadb' : 'mysql';
 
-if ($config{socket} and -S $config{socket})
-{
-    $dsn .= "mysql_socket=$config{socket}";
+$dsn =
+"DBI:$DBI_DRIVER:database=$config{db};${attr_prefix}_read_default_group=mytop;";
+
+if ( $config{socket} and -S $config{socket} ) {
+    $dsn .= "${attr_prefix}_socket=$config{socket}";
 }
-else
-{
+elsif ( lc( $config{host} ) eq 'localhost' ) {
+
+    ## "localhost" means "connect via the local socket" to every MySQL/MariaDB
+    ## client - specifying a port alongside it is meaningless, and DBD::MariaDB
+    ## (unlike DBD::mysql, which just silently ignores it) rejects the DSN
+    ## outright with "port cannot be specified when host is localhost or
+    ## embedded". Omit the port here and let the driver find the default socket.
+    $dsn .= "host=$config{host}";
+}
+else {
     $dsn .= "host=$config{host};port=$config{port}";
 }
 
-if ($config{prompt})
-{
+if ( $config{prompt} ) {
     print "Password: ";
     ReadMode(2);
-    chomp($config{pass} = <STDIN>);
+    chomp( $config{pass} = <STDIN> );
     ReadMode(0);
     print "\n";
 }
 
-my $dbh = DBI->connect($dsn, $config{user}, $config{pass},
-                       { PrintError => 0 });
+my $dbh =
+  DBI->connect( $dsn, $config{user}, $config{pass}, { PrintError => 0 } );
 
-if (not ref $dbh)
-{
+if ( not ref $dbh ) {
+    my $shown_pass =
+      defined $config{pass}
+      ? $config{pass}
+      : '(none - deferred to ~/.my.cnf, if present)';
+
     my $Error = <<EODIE
 Cannot connect to MySQL server. Please check the:
 
   * database you specified "$config{db}" (default is "test")
   * username you specified "$config{user}" (default is "root")
-  * password you specified "$config{pass}" (default is "")
+  * password you specified "$shown_pass" (default is to defer to ~/.my.cnf)
   * hostname you specified "$config{host}" (default is "localhost")
   * port you specified "$config{port}" (default is 3306)
   * socket you specified "$config{socket}" (default is "")
@@ -259,7 +395,7 @@ Here's the exact error from DBI. It might help you debug:
 $DBI::errstr
 
 EODIE
-;
+      ;
 
     die $Error;
 
@@ -271,30 +407,80 @@ ReadMode($RM_RESET) unless $config{batchmode};
 
 my $db_version;
 my $db_release;
+my $is_mariadb = 0;
+my $mariadb_version;
 my $have_query_cache;
 
 my @variables = Hashes("show variables");
 
-foreach (@variables)
-{
-    if ($_->{Variable_name} eq "version")
-    {
+foreach (@variables) {
+    if ( $_->{Variable_name} eq "version" ) {
         $db_version = $_->{Value};
-	$db_release = int(sprintf("%d",$db_version));
+
+        # Detect MariaDB vs MySQL
+        if ( $db_version =~ /mariadb/i ) {
+            $is_mariadb = 1;
+
+            # Extract MariaDB version (e.g., "10.3.39-MariaDB" -> 10.3)
+            if ( $db_version =~ /^(\d+)\.(\d+)/ ) {
+                $mariadb_version = "$1.$2";
+                $db_release      = $1;        # Major version
+            }
+        }
+        else {
+            # MySQL version
+            $db_release = int( sprintf( "%d", $db_version ) );
+        }
+
+        # Strip any "-MariaDB"/"-log"/etc. build suffix for display purposes
+        # (e.g. "11.4.12-MariaDB" -> "11.4.12")
+        $db_version = $1 if ( $db_version =~ /^([^-]+)-/ );
+
         next;
     }
-    if ($_->{Variable_name} eq "have_query_cache")
-    {
-#        if ($_->{Value} eq 'YES')
-	if ($_->{Value} eq 'YES' or $_->{Value} eq 'DEMAND')  # http://freshmeat.net/users/jerjones
+    if ( $_->{Variable_name} eq "have_query_cache" ) {
+        if (   $_->{Value} eq 'YES'
+            or $_->{Value} eq 'DEMAND' )
         {
+
             $have_query_cache = 1;
         }
-        else
-        {
+        else {
             $have_query_cache = 0;
         }
         next;
+    }
+}
+
+## MySQL 8.0+ and MariaDB 10.6+ removed query cache entirely,
+## so check for its existence by looking for Qcache_hits in status variables
+if ( !defined $have_query_cache ) {
+
+    # Query cache variable doesn't exist, check if it was removed
+    if ($is_mariadb) {
+
+        # MariaDB 10.6+ removed query cache
+        if ( $mariadb_version && $mariadb_version >= 10.6 ) {
+            $have_query_cache = 0;
+        }
+        else {
+            # MariaDB 10.5 and earlier may have query cache
+            my @qcache_check = Hashes("SHOW STATUS LIKE 'Qcache_hits'");
+            $have_query_cache =
+              ( @qcache_check && $qcache_check[0]->{Value} ne '' ) ? 1 : 0;
+        }
+    }
+    else {
+        # MySQL 8.0+ removed query cache
+        if ( $db_release >= 8 ) {
+            $have_query_cache = 0;
+        }
+        else {
+            # For MySQL 5.x, try to detect query cache
+            my @qcache_check = Hashes("SHOW STATUS LIKE 'Qcache_hits'");
+            $have_query_cache =
+              ( @qcache_check && $qcache_check[0]->{Value} ne '' ) ? 1 : 0;
+        }
     }
 }
 
@@ -304,55 +490,47 @@ foreach (@variables)
 ##
 #########################################################################
 
-ReadMode($RM_NOBLKRD)  unless $config{batchmode};
+ReadMode($RM_NOBLKRD) unless $config{batchmode};
 
-while (1)
-{
+while (1) {
     my $key;
 
-    if ($config{mode} eq 'qps')
-    {
+    if ( $config{mode} eq 'qps' ) {
         GetQPS();
         $key = ReadKey(1);
 
         next unless $key;
 
-        if ($key =~ /t/i)
-        {
+        if ( $key =~ /t/i ) {
             $config{mode} = 'top';
         }
-        if ($key =~ /q/)
-        {
+        if ( $key =~ /q/ ) {
             cmd_q();
         }
         next;
     }
-    if ($config{mode} eq 'top')
-    {
+    if ( $config{mode} eq 'top' ) {
         GetData();
         last if $config{batchmode};
-        $key = ReadKey($config{delay});
+        $key = ReadKey( $config{delay} );
         next unless $key;
     }
-    elsif ($config{mode} eq 'cmd')
-    {
+    elsif ( $config{mode} eq 'cmd' ) {
         GetCmdSummary();
         last if $config{batchmode};
-        $key = ReadKey($config{delay});
+        $key = ReadKey( $config{delay} );
         next unless $key;
     }
-    elsif ($config{mode} eq 'innodb')
-    {
+    elsif ( $config{mode} eq 'innodb' ) {
         GetInnoDBStatus();
         last if $config{batchmode};
-        $key = ReadKey($config{delay});
+        $key = ReadKey( $config{delay} );
         next unless $key;
     }
-    elsif ($config{mode} eq 'status')
-    {
+    elsif ( $config{mode} eq 'status' ) {
         GetShowStatus();
         last if $config{batchmode};
-        $key = ReadKey($config{delay});
+        $key = ReadKey( $config{delay} );
         next unless $key;
     }
 
@@ -360,46 +538,53 @@ while (1)
     ## keystroke command processing (if we get this far)
     ##
 
-    if ($key eq '!')
-    {
-        Execute("stop slave");
-	Execute("set global sql_slave_skip_counter=1");
-	Execute("start slave");
+    if ( $key eq '!' ) {
+
+        # Try modern REPLICA syntax first (MariaDB 10.5+, MySQL 8.0.22+),
+        # fall back to SLAVE syntax for older versions
+        my $stop_result = Execute("STOP REPLICA");
+        if ( !$stop_result ) {
+            Execute("STOP SLAVE");
+        }
+
+        Execute("SET GLOBAL sql_slave_skip_counter=1");
+
+        if ($stop_result) {
+            Execute("START REPLICA");
+        }
+        else {
+            Execute("START SLAVE");
+        }
     }
 
     # t - top
 
-    if ($key =~ /t/i)
-    {
+    if ( $key =~ /t/i ) {
         $config{mode} = 'top';
     }
 
     ## q - quit
 
-    if ($key eq 'q')
-    {
+    if ( $key eq 'q' ) {
         cmd_q();
     }
 
-    if ($key eq 'D')
-    {
+    if ( $key eq 'D' ) {
         require Data::Dumper;
-        print Data::Dumper::Dumper([\%config]);
+        print Data::Dumper::Dumper( [ \%config ] );
         ReadKey(0);
     }
 
     ## l - change long running hightling
 
-    if ($key eq 'l')
-    {
+    if ( $key eq 'l' ) {
         cmd_l();
         next;
     }
 
     ## m - mode swtich to qps
 
-    if ($key eq 'm')
-    {
+    if ( $key eq 'm' ) {
         $config{mode} = 'qps';
         Clear() unless $config{batchmode};
         print "Queries Per Second [hit q to exit this mode]\n";
@@ -408,8 +593,7 @@ while (1)
 
     ## c - mode swtich to command summary
 
-    if ($key eq 'c')
-    {
+    if ( $key eq 'c' ) {
         $config{mode} = 'cmd';
         Clear() unless $config{batchmode};
         print "Command Summary [hit q to exit this mode]\n";
@@ -418,106 +602,97 @@ while (1)
 
     ## C - change Color on and off
 
-    if ($key eq 'C')
-    {
-	if ( $HAS_COLOR ) 
-        {
-	    $HAS_COLOR = 0;
-	}
-	else
-	{
-	    $HAS_COLOR = 1;
-	}
+    if ( $key eq 'C' ) {
+        if ($HAS_COLOR) {
+            $HAS_COLOR = 0;
+        }
+        else {
+            $HAS_COLOR = 1;
+        }
     }
 
     ## s - seconds of delay
 
-    if ($key eq 's')
-    {
+    if ( $key eq 's' ) {
         cmd_s();
         next;
     }
 
-    if ($key eq 'S')
-    {
-	cmd_S();
-	next;
+    if ( $key eq 'S' ) {
+        cmd_S();
+        next;
     }
 
     ## R - resolve hostnames
-    if ($key eq 'R')
-    {
-        if ($config{resolve})
-        {
+    if ( $key eq 'R' ) {
+        if ( $config{resolve} ) {
             $config{resolve} = 0;
         }
-        else
-        {
+        else {
             $config{resolve} = 1;
         }
     }
 
     ## t - username based filter
 
-    if ($key eq 't')
-    {
+    if ( $key eq 't' ) {
         ReadMode($RM_RESET);
         print RED(), "Which state (blank for all, /.../ for regex): ", RESET();
-        $config{filter_state} = StringOrRegex(ReadLine(0));
+        $config{filter_state} = StringOrRegex( ReadLine(0) );
         ReadMode($RM_NOBLKRD);
         next;
     }
 
     ## u - username based filter
 
-    if ($key eq 'u')
-    {
+    if ( $key eq 'u' ) {
         ReadMode($RM_RESET);
         print RED(), "Which user (blank for all, /.../ for regex): ", RESET();
-        $config{filter_user} = StringOrRegex(ReadLine(0));
+        $config{filter_user} = StringOrRegex( ReadLine(0) );
         ReadMode($RM_NOBLKRD);
         next;
     }
 
     ## d - database name based filter
 
-    if ($key eq 'd')
-    {
+    if ( $key eq 'd' ) {
         ReadMode($RM_RESET);
         print RED(), "Which database (blank for all, /.../ for regex): ",
-            RESET();
-        $config{filter_db} = StringOrRegex(ReadLine(0));
+          RESET();
+        $config{filter_db} = StringOrRegex( ReadLine(0) );
         ReadMode($RM_NOBLKRD);
         next;
     }
 
     ## h - hostname based filter
 
-    if ($key eq 'h')
-    {
+    if ( $key eq 'h' ) {
         ReadMode($RM_RESET);
         print RED(), "Which hostname (blank for all, /.../ for regex): ",
-            RESET();
-        $config{filter_host} = StringOrRegex(ReadLine(0));
+          RESET();
+        $config{filter_host} = StringOrRegex( ReadLine(0) );
         ReadMode($RM_NOBLKRD);
         next;
     }
 
     ## E - Show full Replication Error
 
-    if ($key eq 'E')
-    {
-	my($data) = Hashes('SHOW SLAVE STATUS');
-	Clear();
-	print "Error is: $data->{Last_Error}\n";
-        print RED(), "-- paused. press any key to resume --", RESET();
-	ReadKey(0);
-	next;
+    if ( $key eq 'E' ) {
+
+        # Try REPLICA first (modern syntax), fall back to SLAVE
+        my ($data) = Hashes('SHOW REPLICA STATUS');
+        if ( !$data || !exists $data->{Last_Error} ) {
+            ($data) = Hashes('SHOW SLAVE STATUS');
+        }
+        Clear();
+        print "Error is: $data->{Last_Error}\n" if $data;
+        print RED(), "-- PAUSED - Press any key to resume --", RESET();
+        ReadKey(0);
+        next;
     }
     ## F - remove all filters
 
-    if ($key eq 'F')
-    {
+    if ( $key eq 'F' ) {
         $config{filter_host}  = qr/.?/;
         $config{filter_db}    = qr/.?/;
         $config{filter_user}  = qr/.?/;
@@ -529,26 +704,22 @@ while (1)
 
     ## p - pause
 
-    if ($key eq 'p')
-    {
-        print RED(), "-- paused. press any key to resume --", RESET();
+    if ( $key eq 'p' ) {
+        print RED(), "-- PAUSED - Press any key to resume --", RESET();
         ReadKey(0);
         next;
     }
 
     ## i - idle toggle
 
-    if ($key =~ /i/)
-    {
-        if ($config{idle})
-        {
+    if ( $key =~ /i/ ) {
+        if ( $config{idle} ) {
             $config{idle} = 0;
             $config{sort} = 1;
             print RED(), "-- idle (sleeping) processed filtered --", RESET();
             sleep 1;
         }
-        else
-        {
+        else {
             $config{idle} = 1;
             $config{sort} = 0;
             print RED(), "-- idle (sleeping) processed unfiltered --", RESET();
@@ -558,8 +729,7 @@ while (1)
 
     ## I - InnoDB status
 
-    if ($key =~ 'I')
-    {
+    if ( $key =~ 'I' ) {
         $config{mode} = 'innodb';
         Clear() unless $config{batchmode};
         print "InnoDB Status [hit q to exit this mode]\n";
@@ -568,16 +738,13 @@ while (1)
 
     ## o - sort order
 
-    if ($key =~ /o/)
-    {
-        if ($config{sort})
-        {
+    if ( $key =~ /o/ ) {
+        if ( $config{sort} ) {
             $config{sort} = 0;
             print RED(), "-- sort order reversed --", RESET();
             sleep 1;
         }
-        else
-        {
+        else {
             $config{sort} = 1;
             print RED(), "-- sort order reversed --", RESET();
             sleep 1;
@@ -586,8 +753,7 @@ while (1)
 
     ## ? - help
 
-    if ($key eq '?')
-    {
+    if ( $key eq '?' ) {
         Clear();
         PrintHelp();
         ReadKey(0);
@@ -596,8 +762,7 @@ while (1)
 
     ## k - kill
 
-    if ($key eq 'k')
-    {
+    if ( $key eq 'k' ) {
         ReadMode($RM_RESET);
 
         print RED(), "Thread id to kill: ", RESET();
@@ -605,12 +770,10 @@ while (1)
 
         $id =~ s/\s//g;
 
-        if ($id =~ /^\d+$/)
-        {
+        if ( $id =~ /^\d+$/ ) {
             Execute("KILL $id");
         }
-        else
-        {
+        else {
             print RED(), "-- invalid thread id --", RESET();
             sleep 1;
         }
@@ -620,8 +783,7 @@ while (1)
     }
 
     ## K - kill based on a username
-    if ($key =~ /K/)
-    {
+    if ( $key =~ /K/ ) {
         ReadMode($RM_RESET);
 
         print RED(), "User to kill: ", RESET();
@@ -629,17 +791,14 @@ while (1)
 
         $user =~ s/\s//g;
 
-        if ($user =~ /^\S+$/)
-        {
-            for my $pid (keys %ucache)
-            {
+        if ( $user =~ /^\S+$/ ) {
+            for my $pid ( keys %ucache ) {
                 next unless $ucache{$pid} eq $user;
                 Execute("KILL $pid");
-                select(undef, undef, undef, 0.2);
+                select( undef, undef, undef, 0.2 );
             }
         }
-        else
-        {
+        else {
             print RED(), "-- invalid thread id --", RESET();
             sleep 1;
         }
@@ -649,22 +808,20 @@ while (1)
 
     ## f - full info
 
-    if ($key =~ /f/)
-    {
+    if ( $key =~ /f/ ) {
         ReadMode($RM_RESET);
         print RED(), "Full query for which thread id: ", RESET();
         my $id = ReadLine(0);
         chomp $id;
         FullQueryInfo($id);
         ReadMode($RM_NOBLKRD);
-        print RED(), "-- paused. press any key to resume or (e) to explain --",
-            RESET();
+        print RED(), "-- PAUSED - Press any key to resume or (e) to explain --",
+          RESET();
         my $key = ReadKey(0);
 
-        if ($key eq 'e')
-        {
+        if ( $key eq 'e' ) {
             Explain($id);
-            print RED(), "-- paused. press any key to resume --", RESET();
+            print RED(), "-- PAUSED - Press any key to resume --", RESET();
             ReadKey(0);
         }
 
@@ -673,23 +830,21 @@ while (1)
 
     ## e - explain
 
-    if ($key =~ /e/)
-    {
+    if ( $key =~ /e/ ) {
         ReadMode($RM_RESET);
         print RED(), "Explain which query (id): ", RESET();
         my $id = ReadLine(0);
         chomp $id;
         Explain($id);
         ReadMode($RM_NOBLKRD);
-        print RED(), "-- paused. press any key to resume --", RESET();
+        print RED(), "-- PAUSED - Press any key to resume --", RESET();
         ReadKey(0);
         next;
     }
 
     ## r - reset status counters
 
-    if ($key =~ /r/)
-    {
+    if ( $key =~ /r/ ) {
         Execute("FLUSH STATUS");
         print RED(), "-- counters reset --", RESET();
         sleep 1;
@@ -698,34 +853,28 @@ while (1)
 
     ## H - header toggle
 
-    if ($key eq 'H')
-    {
-        if ($config{header})
-        {
+    if ( $key eq 'H' ) {
+        if ( $config{header} ) {
             $config{header} = 0;
         }
-        else
-        {
+        else {
             $config{header}++;
         }
     }
 
     ## # - magic debug key
 
-    if ($key eq '#')
-    {
+    if ( $key eq '#' ) {
         $debug = 1;
     }
 
-    if ($key eq 'V')
-    {
+    if ( $key eq 'V' ) {
         GetShowVariables();
-        print RED(), "-- paused. press any key to resume --", RESET();
+        print RED(), "-- PAUSED - Press any key to resume --", RESET();
         ReadKey(0);
     }
 
-    if ($key eq 'S')
-    {
+    if ( $key eq 'S' ) {
         $config{mode} = 'status';
     }
 }
@@ -736,61 +885,51 @@ exit;
 
 #######################################################################
 
-sub Clear()
-{
-    if (not $WIN)
-    {
-        print "$CLEAR"
+sub Clear() {
+    if ( not $WIN ) {
+        print "$CLEAR";
     }
-    else
-    {
-        print "\n" x 90; ## dumb hack for now. Anyone know how to
-                         ## clear the screen in dos window on a Win32
-                         ## system??
+    else {
+        print "\n" x 90;    ## dumb hack for now. Anyone know how to
+        ## clear the screen in dos window on a Win32
+        ## system??
     }
 }
 
 my $last_time;
 
-sub GetData()
-{
+sub GetData() {
     ## Get terminal info
     my $now_time;
-    %qcache = ();  ## recycle memory
+    %qcache  = ();    ## recycle memory
     %dbcache = ();
 
-    my ($width, $height, $wpx, $hpx, $lines_left);
+    my ( $width, $height, $wpx, $hpx, $lines_left );
 
-    if (not $config{batchmode})
-    {
-        ($width, $height, $wpx, $hpx) = GetTerminalSize();
+    if ( not $config{batchmode} ) {
+        ( $width, $height, $wpx, $hpx ) = GetTerminalSize();
         $lines_left = $height - 2;
     }
-    else
-    {
-        $height = 999_999;     ## I hope you don't have more than that!
+    else {
+        $height     = 999_999;    ## I hope you don't have more than that!
         $lines_left = 999_999;
-        $width = 80;
+        $width      = 80;
     }
 
     ##
     ## Header stuff.
     ##
-    if ($config{header})
-    {
+    if ( $config{header} ) {
         my @recs = "";
-        if ( $db_release > 4 ) 
-	{
+        if ( $db_release > 4 ) {
             @recs = Hashes("show global status");
-	} 
-	else 
-	{
-           @recs = Hashes("show status");
-	}
+        }
+        else {
+            @recs = Hashes("show status");
+        }
 
         ## if the server died or we lost connectivity
-        if (not @recs)
-        {
+        if ( not @recs ) {
             ReadMode($RM_RESET);
             exit 1;
         }
@@ -798,24 +937,20 @@ sub GetData()
         ## get high-res or low-res time
         my ($t_delta);
 
-        if ($HAS_TIME)
-        {
+        if ($HAS_TIME) {
             $now_time = Time::HiRes::gettimeofday();
         }
-        else
-        {
+        else {
             $now_time = time;
         }
 
-        if ($last_time and $last_time != $now_time)
-        {
-          $t_delta = $now_time - $last_time;
+        if ( $last_time and $last_time != $now_time ) {
+            $t_delta = $now_time - $last_time;
         }
 
         %OLD_STATUS = %STATUS;
 
-        foreach my $ref (@recs)
-        {
+        foreach my $ref (@recs) {
             my $key = $ref->{Variable_name};
             my $val = $ref->{Value};
 
@@ -824,10 +959,11 @@ sub GetData()
 
         ## Compute Key Cache Hit Stats
 
-        $STATUS{Key_read_requests} ||= 1; ## can't divide by zero next
+        $STATUS{Key_read_requests} ||= 1;    ## can't divide by zero next
 
-        my $cache_hits_percent = (100-($STATUS{Key_reads}/$STATUS{Key_read_requests}) * 100);
-        $cache_hits_percent = sprintf("%2.2f",$cache_hits_percent);
+        my $cache_hits_percent =
+          ( 100 - ( $STATUS{Key_reads} / $STATUS{Key_read_requests} ) * 100 );
+        $cache_hits_percent = sprintf( "%2.2f", $cache_hits_percent );
 
         ## Query Cache info for <= Ver. 4.1
         ##
@@ -843,7 +979,7 @@ sub GetData()
         ## | Qcache_free_blocks      | 2        |
         ## | Qcache_total_blocks     | 168      |
         ## +-------------------------+----------+
-	##
+        ##
         ## Query Cache info for => Ver. 5.0
         ##
         ## mysql> show status like 'qcache%';
@@ -864,45 +1000,58 @@ sub GetData()
         my $query_cache_hits_per_sec     = 0;
         my $now_query_cache_hits_per_sec = 0;
 
-        if ($have_query_cache)
-        {
-            $query_cache_hits = $STATUS{Qcache_hits};
+        if ($have_query_cache) {
+            $query_cache_hits         = $STATUS{Qcache_hits};
             $query_cache_hits_per_sec = $STATUS{Qcache_hits} / $STATUS{Uptime};
 
-            if (defined $last_time and $last_time != $now_time)
-            {
+            if ( defined $last_time and $last_time != $now_time ) {
                 my $q_delta = $STATUS{Qcache_hits} - $OLD_STATUS{Qcache_hits};
-                $now_query_cache_hits_per_sec = sprintf "%.2f", $q_delta / $t_delta;
+                $now_query_cache_hits_per_sec = sprintf "%.2f",
+                  $q_delta / $t_delta;
             }
         }
 
-	open L, "</proc/loadavg";
-	my $l = <L>;
-	close L;
-	chomp $l;
+        my ( $load1, $load5, $load15 );
+        if ( open L, "</proc/loadavg" ) {
+            my $loadavg_line = <L>;
+            close L;
 
-        $last_time = $now_time;
+          # Only the first 3 fields (1/5/15 min load averages) are of interest -
+          # the rest of the line is running/total process counts and last PID.
+            if ( defined $loadavg_line ) {
+                ( $load1, $load5, $load15 ) =
+                  ( split /\s+/, $loadavg_line )[ 0 .. 2 ];
+            }
+        }
+
+       # /proc/loadavg doesn't exist on non-Linux systems, so $load1 stays undef
 
         ## Server Uptime in meaningful terms...
 
-        my $time         = $STATUS{Uptime};
-        my ($d,$h,$m,$s) = (0, 0, 0, 0);
+        my $time = $STATUS{Uptime};
 
-        $d += int($time / (60*60*24)); $time -= $d * (60*60*24);
-        $h += int($time / (60*60));    $time -= $h * (60*60);
-        $m += int($time / (60));       $time -= $m * (60);
-        $s += int($time);
+        my $d = int( $time / ( 60 * 60 * 24 ) );
+        $time -= $d * ( 60 * 60 * 24 );
+        my $h = int( $time / ( 60 * 60 ) );
+        $time -= $h * ( 60 * 60 );
+        my $m = int( $time / 60 );
 
-        my $uptime = sprintf("%d+%02d:%02d:%02d", $d, $h, $m, $s);
+        ## Match the classic `uptime` command's phrasing, e.g. "285 days, 11:08"
+        ## or "5 min" when under an hour - no point showing seconds-level precision
+        ## for something that's usually measured in days.
+        my $uptime_days = $d == 1 ? "1 day, " : $d > 1 ? "$d days, " : '';
+        my $uptime =
+          $uptime_days . ( $h == 0 ? "$m min" : sprintf( "%d:%02d", $h, $m ) );
 
         ## Queries per second...
 
-        my $avg_queries_per_sec  = sprintf("%.2f", $STATUS{Questions} / $STATUS{Uptime});
-        my $num_queries          = $STATUS{Questions};
+        my $avg_queries_per_sec =
+          sprintf( "%.2f", $STATUS{Questions} / $STATUS{Uptime} );
+        my $num_queries = $STATUS{Questions};
 
         my @t = localtime(time);
 
-        my $current_time = sprintf "[%02d:%02d:%02d]", $t[2], $t[1], $t[0];
+        my $current_time = sprintf "%02d:%02d:%02d", $t[2], $t[1], $t[0];
 
         my $host_width = 75;
         my $up_width   = $width - $host_width;
@@ -910,159 +1059,205 @@ sub GetData()
         Clear() unless $config{batchmode};
         print RESET();
 
+        my $db_type = $is_mariadb ? "MariaDB" : "MySQL";
+        my $load_display =
+          defined $load1
+          ? "Load Avg.: $load1 (1m) $load5 (5m) $load15 (15m) - "
+          : '';
         printf "%-${host_width}s%${up_width}s\n",
-               "MySQL on $config{host} ($db_version)",
-               "load $l up $uptime $current_time";
+          "$db_type $db_version on $config{host} -- mytop v$main::VERSION",
+          "${load_display}Uptime: $uptime";
         $lines_left--;
 
+        printf "%-${host_width}s%${up_width}s\n", '',
+          "Current Time: $current_time";
+        $lines_left--;
 
-        printf " Queries: %-6s  qps: %4.0f Slow: %7s         Se/In/Up/De(%%):    %02.0f/%02.0f/%02.0f/%02.0f \n",
-               make_short( $STATUS{Questions} ),  # q total
-               $STATUS{Questions} / $STATUS{Uptime},  # qps, average
-               make_short( $STATUS{Slow_queries} ),    # slow
+        printf
+" Queries: %-6s  qps: %4.0f Slow: %7s         Se/In/Up/De(%%):    %02.0f/%02.0f/%02.0f/%02.0f \n",
+          make_short( $STATUS{Questions} ),        # q total
+          $STATUS{Questions} / $STATUS{Uptime},    # qps, average
+          make_short( $STATUS{Slow_queries} ),     # slow
 
-               # hmm. a Qcache hit is really a select and should be counted.
-               100 * ($STATUS{Com_select} + ($STATUS{Qcache_hits}||0) )    / $STATUS{Questions},
-               100 * ($STATUS{Com_insert} +  $STATUS{Com_replace} ) / $STATUS{Questions},
-               100 * ($STATUS{Com_update} )  / $STATUS{Questions},
-               100 * $STATUS{Com_delete} / $STATUS{Questions};
+          # hmm. a Qcache hit is really a select and should be counted.
+          100 * ( $STATUS{Com_select} + ( $STATUS{Qcache_hits} || 0 ) ) /
+          $STATUS{Questions},
+          100 * ( $STATUS{Com_insert} + $STATUS{Com_replace} ) /
+          $STATUS{Questions},
+          100 * ( $STATUS{Com_update} ) / $STATUS{Questions},
+          100 * $STATUS{Com_delete} / $STATUS{Questions};
 
         $lines_left--;
 
-        if ($t_delta)
-        {
-          my $q_diff = ( $STATUS{Questions} - $OLD_STATUS{Questions} );
-#          print("q_diff: $STATUS{Questions} - $OLD_STATUS{Questions}  / $t_delta = $q_diff\n");
+        if ($t_delta) {
+            my $q_diff = ( $STATUS{Questions} - $OLD_STATUS{Questions} );
+            printf(
+" Sorts: %5.0f qps now: %4.0f Slow qps: %3.1f  Threads: %4.0f (%4.0f/%4.0f) %02.0f/%02.0f/%02.0f/%02.0f \n",
+                ( $STATUS{Sort_rows} - $OLD_STATUS{Sort_rows} ) / $t_delta,
+                ( $STATUS{Questions} - $OLD_STATUS{Questions} ) / $t_delta,
+                (    # slow now (qps)
+                    ( $STATUS{Slow_queries} )
+                    ? ( $STATUS{Slow_queries} - $OLD_STATUS{Slow_queries} ) /
+                      $t_delta
+                    : 0
+                ),
+                $STATUS{Threads_connected},
+                $STATUS{Threads_running},
+                $STATUS{Threads_cached},
 
-          printf(" Sorts: %5.0f qps now: %4.0f Slow qps: %3.1f  Threads: %4.0f (%4.0f/%4.0f) %02.0f/%02.0f/%02.0f/%02.0f \n",
-		 ( $STATUS{Sort_rows} - $OLD_STATUS{Sort_rows} ) / $t_delta, 
-                 ( $STATUS{Questions} - $OLD_STATUS{Questions} ) / $t_delta,
-                 ( # slow now (qps)
-                  ($STATUS{Slow_queries} ) ?
-                  ( $STATUS{Slow_queries} - $OLD_STATUS{Slow_queries} ) / $t_delta :
-                  0
-                 ),
-                 $STATUS{Threads_connected},
-                 $STATUS{Threads_running},
-                 $STATUS{Threads_cached},
-
-                 (100 * ($STATUS{Com_select} - $OLD_STATUS{Com_select} + 
-                         ($STATUS{Qcache_hits}||0) - ($OLD_STATUS{Qcache_hits}||0)
-                        ) ) / ($q_diff ),
-                 (100 * ($STATUS{Com_insert} - $OLD_STATUS{Com_insert} +
-                         $STATUS{Com_replace} - $OLD_STATUS{Com_replace}
-                        ) ) / ($q_diff ),
-                 (100 * ($STATUS{Com_update} - $OLD_STATUS{Com_update}) ) / ($q_diff ),
-                 (100 * ($STATUS{Com_delete} - $OLD_STATUS{Com_delete}) ) / ($q_diff ),
-                 );
+                (
+                    100 * (
+                        $STATUS{Com_select} -
+                          $OLD_STATUS{Com_select} +
+                          ( $STATUS{Qcache_hits}     || 0 ) -
+                          ( $OLD_STATUS{Qcache_hits} || 0 )
+                    )
+                ) / ($q_diff),
+                (
+                    100 * (
+                        $STATUS{Com_insert} -
+                          $OLD_STATUS{Com_insert} +
+                          $STATUS{Com_replace} -
+                          $OLD_STATUS{Com_replace}
+                    )
+                ) / ($q_diff),
+                ( 100 * ( $STATUS{Com_update} - $OLD_STATUS{Com_update} ) ) /
+                  ($q_diff),
+                ( 100 * ( $STATUS{Com_delete} - $OLD_STATUS{Com_delete} ) ) /
+                  ($q_diff),
+            );
         }
-        else
-        {
+        else {
             print "\n";
         }
         $lines_left--;
 
-        if ($have_query_cache and $STATUS{Com_select} and $query_cache_hits)
+        if (    $have_query_cache
+            and $STATUS{Com_select}
+            and $query_cache_hits
+            and defined $STATUS{Qcache_hits} )
         {
-          printf(" Cache Hits: %-5s Hits/s: %4.1f Hits now: %5.1f  Ratio: ",
-                 make_short($STATUS{Qcache_hits}),        # cache hits
-                 $STATUS{Qcache_hits} / $STATUS{Uptime}, # hits / sec
-                 ($t_delta) ?  ($STATUS{Qcache_hits} - $OLD_STATUS{Qcache_hits}) / $t_delta : 0,  # Hits Now
-                 );
+            printf(
+                " Cache Hits: %-5s Hits/s: %4.1f Hits now: %5.1f  Ratio: ",
+                make_short( $STATUS{Qcache_hits} || 0 ),    # cache hits
+                ( $STATUS{Qcache_hits} || 0 ) / $STATUS{Uptime},    # hits / sec
+                ($t_delta)
+                ? ( ( $STATUS{Qcache_hits} || 0 ) -
+                      ( $OLD_STATUS{Qcache_hits} || 0 ) ) / $t_delta
+                : 0,                                                # Hits Now
+            );
 
-          my($Ratio) =  100 * ($STATUS{Qcache_hits})  / ($STATUS{Qcache_hits} + $STATUS{Com_select} );
-          if ($HAS_COLOR)
-          {
-                print YELLOW() if ($Ratio < 80.0);
-                print RED() if ($Ratio < 50.0);
-                print MAGENTA() if ($Ratio < 20.0);
-          }
-          printf("%4.1f%% ",$Ratio);
-          if ($HAS_COLOR)
-          {
+            my ($Ratio) = 100 * ( $STATUS{Qcache_hits} || 0 ) /
+              ( ( $STATUS{Qcache_hits} || 0 ) + $STATUS{Com_select} );
+            if ($HAS_COLOR) {
+                print YELLOW()  if ( $Ratio < 80.0 );
+                print RED()     if ( $Ratio < 50.0 );
+                print MAGENTA() if ( $Ratio < 20.0 );
+            }
+            printf( "%4.1f%% ", $Ratio );
+            if ($HAS_COLOR) {
                 print RESET();
-          }
+            }
 
-          print " Ratio now: ";
-          my($Ratio_now) = ($t_delta) ?   # ratio now
-                 100 * ($STATUS{Qcache_hits} - $OLD_STATUS{Qcache_hits} ) /
-                 ( ($STATUS{Com_select} + $STATUS{Qcache_hits} -
-                    ($OLD_STATUS{Qcache_hits} + $OLD_STATUS{Com_select})
-                   ) || 1) : 0;
-          if ($HAS_COLOR)
-          {
-                print GREEN() if ($Ratio_now => 80.0);
-                print YELLOW() if ($Ratio_now < 80.0);
-                print RED() if ($Ratio_now < 50.0);
-                print MAGENTA() if ($Ratio_now < 20.0);
-          }
-          printf("%4.1f%% \n",$Ratio_now);
-          if ($HAS_COLOR)
-          {
+            print " Ratio now: ";
+            my ($Ratio_now) = ($t_delta)
+              ?    # ratio now
+              100 * ( ( $STATUS{Qcache_hits} || 0 ) -
+                  ( $OLD_STATUS{Qcache_hits} || 0 ) ) /
+              (
+                (
+                    $STATUS{Com_select} + ( $STATUS{Qcache_hits} || 0 ) - (
+                        ( $OLD_STATUS{Qcache_hits} || 0 ) +
+                          $OLD_STATUS{Com_select}
+                    )
+                )
+                  || 1
+              )
+              : 0;
+            if ($HAS_COLOR) {
+                print GREEN()   if ( $Ratio_now >= 80.0 );
+                print YELLOW()  if ( $Ratio_now < 80.0 );
+                print RED()     if ( $Ratio_now < 50.0 );
+                print MAGENTA() if ( $Ratio_now < 20.0 );
+            }
+            printf( "%4.1f%% \n", $Ratio_now );
+            if ($HAS_COLOR) {
                 print RESET();
-          }
+            }
         }
         $lines_left--;
 
-
-        printf(" Key Efficiency: %2.1f%%  Bps in/out: %5s/%5s   ",
-               $cache_hits_percent,
-               make_short($STATUS{Bytes_received} / $STATUS{Uptime} ),
-               make_short($STATUS{Bytes_sent} / $STATUS{Uptime}));
-        printf("Now in/out: %5s/%5s",
-               make_short(($STATUS{Bytes_received} - $OLD_STATUS{Bytes_received}) / $t_delta ),
-               make_short(($STATUS{Bytes_sent} - $OLD_STATUS{Bytes_sent}) / $t_delta ))
-          if ($t_delta);
+        printf(
+            " Key Efficiency: %2.1f%%  Bps in/out: %5s/%5s   ",
+            $cache_hits_percent,
+            make_short( $STATUS{Bytes_received} / $STATUS{Uptime} ),
+            make_short( $STATUS{Bytes_sent} / $STATUS{Uptime} )
+        );
+        printf(
+            "Now in/out: %5s/%5s",
+            make_short(
+                ( $STATUS{Bytes_received} - $OLD_STATUS{Bytes_received} ) /
+                  $t_delta
+            ),
+            make_short(
+                ( $STATUS{Bytes_sent} - $OLD_STATUS{Bytes_sent} ) / $t_delta
+            )
+        ) if ($t_delta);
         print "\n";
 
         $lines_left--;
 
-        my($data) = Hashes('show global variables like "read_only"');
-        if ($data->{Value} ne "OFF")
-        {
-            print RED() if ($HAS_COLOR) ;
+        my ($data) = Hashes('show global variables like "read_only"');
+        if ( $data && $data->{Value} && $data->{Value} ne "OFF" ) {
+            print RED() if ($HAS_COLOR);
             print " ReadOnly";
-	    RESET() if ($HAS_COLOR);
+            print RESET() if ($HAS_COLOR);
         }
 
-	my($data) = Hashes('SHOW SLAVE STATUS');
-	if (defined($data->{Master_Host}))
-        {
-	    if (defined($data->{Seconds_Behind_Master}))
-	    {
-                if ($HAS_COLOR) {
-	  	    print GREEN();
-		    print YELLOW() if ($data->{Seconds_Behind_Master}  >  60);
-		    print MAGENTA() if ($data->{Seconds_Behind_Master} > 360);
-	        }
-	    }
-	    print " Replication ";
-	    print "IO:$data->{Slave_IO_Running} ";
- 	    print "SQL:$data->{Slave_SQL_Running} ";
-	    print RESET() if ($HAS_COLOR);
+        # Try REPLICA first (modern syntax), fall back to SLAVE
+        my ($slave_data) = Hashes('SHOW REPLICA STATUS');
+        if ( !$slave_data || !exists $slave_data->{Master_Host} ) {
+            ($slave_data) = Hashes('SHOW SLAVE STATUS');
+        }
 
- 	    if (defined($data->{Seconds_Behind_Master}))
-	    {
-        	if ($HAS_COLOR) {
-			print GREEN();
-			print YELLOW() if ($data->{Seconds_Behind_Master}  >  60);
-			print MAGENTA() if ($data->{Seconds_Behind_Master} > 360);
-		}
-		print "Delay: $data->{Seconds_Behind_Master} sec.";
-	    } else {
-	        my $free = $width - 45;
-		my $Err = substr $data->{Last_Error},0 ,$free;
-	        printf(" ERR: %-${free}s", $Err) if ( $Err ne "" );
-	    }
-	    print WHITE() if ($HAS_COLOR);
-	    print "\n";
-	    $lines_left--;
-	}
-	print "\n";
+        if ( $slave_data && defined( $slave_data->{Master_Host} ) ) {
+            if ( defined( $slave_data->{Seconds_Behind_Master} ) ) {
+                if ($HAS_COLOR) {
+                    print GREEN();
+                    print YELLOW()
+                      if ( $slave_data->{Seconds_Behind_Master} > 60 );
+                    print MAGENTA()
+                      if ( $slave_data->{Seconds_Behind_Master} > 360 );
+                }
+            }
+            print " Replication ";
+            print "IO:$slave_data->{Slave_IO_Running} ";
+            print "SQL:$slave_data->{Slave_SQL_Running} ";
+            print RESET() if ($HAS_COLOR);
+
+            if ( defined( $slave_data->{Seconds_Behind_Master} ) ) {
+                if ($HAS_COLOR) {
+                    print GREEN();
+                    print YELLOW()
+                      if ( $slave_data->{Seconds_Behind_Master} > 60 );
+                    print MAGENTA()
+                      if ( $slave_data->{Seconds_Behind_Master} > 360 );
+                }
+                print "Delay: $slave_data->{Seconds_Behind_Master} sec.";
+            }
+            else {
+                my $free = $width - 45;
+                my $Err  = substr $slave_data->{Last_Error}, 0, $free;
+                printf( " ERR: %-${free}s", $Err ) if ( $Err ne "" );
+            }
+            print WHITE() if ($HAS_COLOR);
+            print "\n";
+            $lines_left--;
+        }
+        print "\n";
     }
 
-    if (not $config{batchmode} and not $config{header})
-    {
+    if ( not $config{batchmode} and not $config{header} ) {
         Clear();
         print RESET();
     }
@@ -1072,20 +1267,20 @@ sub GetData()
     ##
 
     #my $sz = $width - 52;
-    my @sz   = (9, 9, 15, 10, 10, 6, 8);
+    my @sz   = ( 9, 9, 15, 10, 10, 6, 8 );
     my $used = scalar(@sz) + Sum(@sz);
     my $free = $width - $used;
 
     print BOLD() if ($HAS_COLOR);
 
     printf "%9s %9s %15s %10s %10s %6s %8s %-${free}s\n",
-        'Id','User','Host/IP','DB','Time', 'Cmd', 'State', 'Query';
+      'Id', 'User', 'Host/IP', 'DB', 'Time', 'Cmd', 'State', 'Query';
 
     print RESET() if ($HAS_COLOR);
 
     ##      Id User Host DB
     printf "%9s %9s %15s %10s %10s %6s %8s %-${free}s\n",
-        '--','----','-------','--','----', '---', '-----', '----------';
+      '--', '----', '-------', '--', '----', '---', '-----', '----------';
 
     $lines_left -= 2;
 
@@ -1093,8 +1288,7 @@ sub GetData()
 
     my @data = Hashes($proc_cmd);
 
-    foreach my $thread (@data)
-    {
+    foreach my $thread (@data) {
         last if not $lines_left;
 
         ## Drop Domain Name, unless it looks like an IP address.  If
@@ -1103,24 +1297,19 @@ sub GetData()
 
         my $is_ip = 0;
 
-        if ($thread->{Host} =~ /^(\d{1,3}\.){3}(\d{1,3})(:\d+)?$/)
-        {
+        if ( $thread->{Host} =~ /^(\d{1,3}\.){3}(\d{1,3})(:\d+)?$/ ) {
             $thread->{Host} =~ s/:.*$//;
             $is_ip = 1;
         }
-        else
-        {
+        else {
             $thread->{Host} =~ s/^([^.]+).*/$1/;
         }
 
         ## Otherwise, look up the IP (if resolve is set) and strip the
         ## name
-        if ($is_ip and $config{resolve})
-        {
+        if ( $is_ip and $config{resolve} ) {
             $thread->{Host} =~ s/:\d+$//;
-#	    my $host = $thread->{Host};
-	    my $host = gethostbyaddr(inet_aton($thread->{Host}), AF_INET);
-#            $host =~ s/^([^.]+).*/$1/;
+            my $host = gethostbyaddr( inet_aton( $thread->{Host} ), AF_INET );
             $thread->{Host} = $host;
         }
 
@@ -1128,16 +1317,16 @@ sub GetData()
 
         $thread->{db}      ||= '';
         $thread->{Info}    ||= '';
-        $thread->{Time}    ||= 0 ;
-        $thread->{Id}      ||= 0 ;
+        $thread->{Time}    ||= 0;
+        $thread->{Id}      ||= 0;
         $thread->{User}    ||= '';
         $thread->{Command} ||= '';
         $thread->{Host}    ||= '';
-	$thread->{State}   ||= "";
+        $thread->{State}   ||= "";
 
-	## alter double hyphen comments so they don't break 
-	## the query when newlines are removed - http://freshmeat.net/users/jerjones
-	$thread->{Info} =~ s~\s--(.*)$~ /* $1 */ ~mg; 
+        ## alter double hyphen comments so they don't break
+        ## the query when newlines are removed - http://freshmeat.net/users/jerjones
+        $thread->{Info} =~ s~\s--(.*)$~ /* $1 */ ~mg;
 
         ## Normalize spaces -- mostly disabled for now.  This can
         ## break EXPLAIN if you try to explain a mangled query.  It
@@ -1146,20 +1335,24 @@ sub GetData()
         ## leading space removal
         $thread->{Info} =~ s/^\s*//;
 
-        if (1)
-        {
-            ## remove newlines and carriage returns
-            $thread->{Info} =~ s/[\n\r]//g;
+        if (1) {
+            ## remove newlines and carriage returns, replace with space to prevent keywords running together
+            $thread->{Info} =~ s/[\n\r]+/ /g;
 
-            ## collpase whitespace
+            ## collapse whitespace
             $thread->{Info} =~ s/\s+/ /g;
         }
 
+        ## strip any remaining non-printing control bytes (e.g. stray ESC/NUL from
+        ## binary data embedded in stored query text) so they can't corrupt or
+        ## inject escape sequences into the terminal display
+        $thread->{Info} =~ s/[[:cntrl:]]//g;
+
         ## stow it in the cache
 
-        $qcache{$thread->{Id}}  = $thread->{Info};
-        $dbcache{$thread->{Id}} = $thread->{db};
-        $ucache{$thread->{Id}}  = $thread->{User};
+        $qcache{ $thread->{Id} }  = $thread->{Info};
+        $dbcache{ $thread->{Id} } = $thread->{db};
+        $ucache{ $thread->{Id} }  = $thread->{User};
 
     }
 
@@ -1167,68 +1360,59 @@ sub GetData()
 
     my @sorted;
 
-    if (not $config{sort})
-    {
-        @sorted = sort { $a->{Time} <=> $b->{Time} } @data
+    if ( not $config{sort} ) {
+        @sorted = sort { $a->{Time} <=> $b->{Time} } @data;
     }
-    else
-    {
-        @sorted = sort { $b->{Time} <=> $a->{Time} } @data
+    else {
+        @sorted = sort { $b->{Time} <=> $a->{Time} } @data;
     }
 
-    foreach my $thread (@sorted)
-    {
+    foreach my $thread (@sorted) {
+
         # Check to see if we can skip out.  We skip out if we know the
         # given line doesn't match.
 
-        next if (($thread->{Command} eq "Sleep")
-                 and
-                 (not $config{idle}));
+        next if ( ( $thread->{Command} eq "Sleep" )
+            and ( not $config{idle} ) );
 
-        next if (($thread->{Command} eq "Binlog Dump")
-                 and
-                 (not $config{idle}));
+        next
+          if (  ( $thread->{Command} eq "Binlog Dump" )
+            and ( not $config{idle} ) );
 
-        next if (($thread->{Command} eq "Daemon")
-                 and
-                 (not $config{idle}));
+        next
+          if (  ( $thread->{Command} eq "Daemon" )
+            and ( not $config{idle} ) );
 
-        next if ($thread->{User}  !~ $config{filter_user});
-        next if ($thread->{db}    !~ $config{filter_db});
-        next if ($thread->{Host}  !~ $config{filter_host});
-        next if ($thread->{State} !~ $config{filter_state});
+        next if ( $thread->{User}  !~ $config{filter_user} );
+        next if ( $thread->{db}    !~ $config{filter_db} );
+        next if ( $thread->{Host}  !~ $config{filter_host} );
+        next if ( $thread->{State} !~ $config{filter_state} );
 
-        $thread->{State} = trim(sprintf("%8.8s",$thread->{State}));
+        $thread->{State} = trim( sprintf( "%8.8s", $thread->{State} ) );
 
         # Otherwise, print.
 
         my $smInfo;
 
-        if ($thread->{Info})
-        {
+        if ( $thread->{Info} ) {
             $smInfo = substr $thread->{Info}, 0, $free;
         }
-#        if ($thread->{State})
-#        {
-#            $smInfo = substr $thread->{State}, 0, $free;
-#        }
-        else
-        {
+        else {
             $smInfo = "";
         }
 
-        if ($HAS_COLOR)
-        {
-            print YELLOW() if $thread->{Command} eq 'Query';
-            print WHITE()  if $thread->{Command} eq 'Sleep';
-            print GREEN()  if $thread->{Command} eq 'Connect';
-            print BOLD() if $thread->{Time} > $config{slow};
-	    print MAGENTA() if $thread->{Time} > $config{long};
+        if ($HAS_COLOR) {
+            print YELLOW()  if $thread->{Command} eq 'Query';
+            print WHITE()   if $thread->{Command} eq 'Sleep';
+            print GREEN()   if $thread->{Command} eq 'Connect';
+            print BOLD()    if $thread->{Time} > $config{slow};
+            print MAGENTA() if $thread->{Time} > $config{long};
         }
 
-        printf "%9d %9.9s %15.15s %10.10s %10d %6.6s %8.8s %-${free}.${free}s\n",
-            $thread->{Id}, $thread->{User}, $thread->{Host}, $thread->{db},
-            $thread->{Time}, $thread->{Command}, $thread->{State}, $smInfo;
+        printf
+          "%9d %9.9s %15.15s %10.10s %10d %6.6s %8.8s %-${free}.${free}s\n",
+          $thread->{Id},   $thread->{User},    $thread->{Host},  $thread->{db},
+          $thread->{Time}, $thread->{Command}, $thread->{State}, $smInfo;
 
         print RESET() if $HAS_COLOR;
 
@@ -1238,18 +1422,20 @@ sub GetData()
 
     }
 
+    ## Add blank line after thread list for better spacing with interactive commands
+    print "\n";
+
 }
 
 ###########################################################################
 
 my $questions;
 
-sub GetQPS()
-{
-    my($data) = Hashes('SHOW STATUS LIKE "Questions"');
-    my $num   = $data->{Value};
+sub GetQPS() {
+    my ($data) = Hashes('SHOW STATUS LIKE "Questions"');
+    my $num = $data->{Value};
 
-    if (not defined $questions) ## first time?
+    if ( not defined $questions )    ## first time?
     {
         $questions = $num;
         return;
@@ -1262,49 +1448,65 @@ sub GetQPS()
 
 ###########################################################################
 
-sub GetQcacheSummary()
-{
+sub GetQcacheSummary() {
 }
 
 ###########################################################################
 
-sub GetInnoDBStatus()
-{
-    if (not $config{pager})
-    {
-        if (not $config{pager} = FindProg('less'))
-        {
+sub GetInnoDBStatus() {
+    if ( not $config{pager} ) {
+        if ( not $config{pager} = FindProg('less') ) {
             $config{pager} = FindProg('more');
         }
     }
 
-    my @data = Hashes("SHOW INNODB STATUS");
+    # Use modern syntax (MySQL 5.0+, MariaDB 10.x+)
+    # Falls back to old syntax if needed
+    my @data;
+    eval { @data = Hashes("SHOW ENGINE INNODB STATUS"); };
 
-    open P, "|$config{pager}" or die "$!";
-    print keys %{$data[0]};
-    print $data[0]->{Status},"\n";
-    close P;
+    if ( $@ || !@data ) {
+
+        # Fallback to old syntax for very old versions
+        @data = Hashes("SHOW INNODB STATUS");
+    }
+
+    if ( @data && $data[0] ) {
+        open P, "|$config{pager}" or die "$!";
+
+# Handle both old format (Status column) and new format (Type, Name, Status columns)
+        if ( exists $data[0]->{Status} ) {
+            print P $data[0]->{Status}, "\n";
+        }
+        elsif ( exists $data[0]->{Type} ) {
+
+            # New format has Type, Name, Status columns
+            for my $row (@data) {
+                print P "Type: $row->{Type}\n" if $row->{Type};
+                print P "Name: $row->{Name}\n" if $row->{Name};
+                print P $row->{Status}, "\n" if $row->{Status};
+            }
+        }
+        close P;
+    }
 }
 
 ###########################################################################
 
 my %prev_data;
 
-sub GetCmdSummary()
-{
-    my ($width, $height, $wpx, $hpx, $lines_left);
+sub GetCmdSummary() {
+    my ( $width, $height, $wpx, $hpx, $lines_left );
 
-    if (not $config{batchmode})
-    {
-        ($width, $height, $wpx, $hpx) = GetTerminalSize();
+    if ( not $config{batchmode} ) {
+        ( $width, $height, $wpx, $hpx ) = GetTerminalSize();
 
         $lines_left = $height - 2;
     }
-    else
-    {
-        $height = 999_999;     ## I hope you don't have more than that!
+    else {
+        $height     = 999_999;    ## I hope you don't have more than that!
         $lines_left = 999_999;
-        $width = 80;
+        $width      = 80;
     }
 
     # Variable_name and Value pairs come back...
@@ -1316,49 +1518,47 @@ sub GetCmdSummary()
     my $total;
     my $delta_total;
 
-    for my $item (@data)
-    {
+    for my $item (@data) {
         next unless $item->{Value};
         $item->{Variable_name} =~ s/^Com_//;
         $item->{Variable_name} =~ s/_/ /g;
-        $cmd_data{$item->{Variable_name}} = $item->{Value};
+        $cmd_data{ $item->{Variable_name} } = $item->{Value};
         $total += $item->{Value};
     }
 
     ## Populate other stats
 
-    for my $item (keys %cmd_data)
-    {
-        $cmd_delta{$item} = $cmd_data{$item} -
-            ($prev_data{$item} || $cmd_data{$item} - 1);
+    for my $item ( keys %cmd_data ) {
+        $cmd_delta{$item} =
+          $cmd_data{$item} - ( $prev_data{$item} || $cmd_data{$item} - 1 );
 
         $delta_total += $cmd_delta{$item};
 
-        $cmd_pct{$item}  = int(($cmd_data{$item} / $total) * 100);
+        $cmd_pct{$item} = int( ( $cmd_data{$item} / $total ) * 100 );
     }
 
-    for my $item (keys %cmd_data)
-    {
-        $cmd_delta_pct{$item}  = int(($cmd_delta{$item} / $delta_total) * 100);
+    for my $item ( keys %cmd_data ) {
+        $cmd_delta_pct{$item} =
+          int( ( $cmd_delta{$item} / $delta_total ) * 100 );
     }
-
 
     ## Display
 
     Clear() unless $config{batchmode};
     print RESET();
-    printf "%18s %10s %4s  | %5s %4s\n", 'Command', 'Total', 'Pct', 'Last', 'Pct';
-    printf "%18s %10s %4s  | %5s %4s\n", '-------', '-----', '---', '----', '---';
+    printf "%18s %10s %4s  | %5s %4s\n", 'Command', 'Total', 'Pct', 'Last',
+      'Pct';
+    printf "%18s %10s %4s  | %5s %4s\n", '-------', '-----', '---', '----',
+      '---';
     $lines_left -= 2;
 
-    for my $item (sort { $cmd_data{$b} <=> $cmd_data{$a} } keys %cmd_data)
-    {
+    for my $item ( sort { $cmd_data{$b} <=> $cmd_data{$a} } keys %cmd_data ) {
         printf "%18s %10d %4s  | %5d %4s\n",
-            $item,
-            $cmd_data{$item},
-            $cmd_pct{$item} . "%",
-            $cmd_delta{$item},
-            $cmd_delta_pct{$item} . "%";
+          $item,
+          $cmd_data{$item},
+          $cmd_pct{$item} . "%",
+          $cmd_delta{$item},
+          $cmd_delta_pct{$item} . "%";
 
         last if not $lines_left;
         $lines_left -= 1;
@@ -1369,12 +1569,9 @@ sub GetCmdSummary()
 
 ###########################################################################
 
-sub GetShowVariables()
-{
-    if (not $config{pager})
-    {
-        if (not $config{pager} = FindProg('less'))
-        {
+sub GetShowVariables() {
+    if ( not $config{pager} ) {
+        if ( not $config{pager} = FindProg('less') ) {
             $config{pager} = FindProg('more');
         }
     }
@@ -1383,8 +1580,7 @@ sub GetShowVariables()
 
     open P, "|$config{pager}" or die "$!";
 
-    for my $row (@rows)
-    {
+    for my $row (@rows) {
         my $name  = $row->{Variable_name};
         my $value = $row->{Value};
         printf P "%32s: %s\n", $name, $value;
@@ -1395,41 +1591,36 @@ sub GetShowVariables()
 
 ###########################################################################
 
-sub GetShowStatus()
-{
+sub GetShowStatus() {
     Clear() unless $config{batchmode};
     my @rows = Hashes("SHOW STATUS");
 
     printf "%32s  %10s %10s\n", 'Counter', 'Total', 'Change';
     printf "%32s  %10s %10s\n", '-------', '-----', '------';
 
-    for my $row (@rows)
-    {
+    for my $row (@rows) {
         my $name  = $row->{Variable_name};
         my $value = $row->{Value};
         my $old   = $statcache{$name};
         my $delta = 0;
 
-        next if $name  =~ m/^Com_/;      ## skip Com_ stats
-        next if $value =~ m/^[^0-9]*$/;  ## skip non-numeric
+        next if $name  =~ m/^Com_/;        ## skip Com_ stats
+        next if $value =~ m/^[^0-9]*$/;    ## skip non-numeric
 
         ## TODO: if Qcache is off, we should skip Qcache_ values
 
-        if ($HAS_COLOR and defined $old and $old =~ /^\d/)
-        {
-            if ($value > $old)
-            {
+        if ( $HAS_COLOR and defined $old and $old =~ /^\d/ ) {
+            if ( $value > $old ) {
                 print YELLOW();
                 $delta = $value - $old;
             }
-            elsif ($value < $old)
-            {
+            elsif ( $value < $old ) {
                 print RED();
                 $delta = $value - $old;
             }
 
-            if (not $config{idle} and $value == $old)
-            {
+            if ( not $config{idle} and $value == $old ) {
+
                 # filter unchanging stats, maybe
                 print RESET();
                 next;
@@ -1446,12 +1637,10 @@ sub GetShowStatus()
 
 ###########################################################################
 
-sub FullQueryInfo($)
-{
+sub FullQueryInfo($) {
     my $id = shift;
 
-    if (not exists $qcache{$id} or not defined $qcache{$id})
-    {
+    if ( not exists $qcache{$id} or not defined $qcache{$id} ) {
         print "*** Invalid id. ***\n";
         return;
     }
@@ -1459,17 +1648,15 @@ sub FullQueryInfo($)
     my $sql = $qcache{$id};
     print $CLEAR;
     print "Thread $id was executing following query:\n\n";
-    print YELLOW(), $sql,"\n\n", RESET();
+    print YELLOW(), $sql, "\n\n", RESET();
 }
 
 ###########################################################################
 
-sub Explain($)
-{
-    my $id  = shift;
+sub Explain($) {
+    my $id = shift;
 
-    if (not exists $qcache{$id} or not defined $qcache{$id})
-    {
+    if ( not exists $qcache{$id} or not defined $qcache{$id} ) {
         print "*** Invalid id. ***\n";
         return;
     }
@@ -1477,25 +1664,83 @@ sub Explain($)
     my $sql = $qcache{$id};
     my $db  = $dbcache{$id};
 
-    Execute("USE $db");
-    my @info = Hashes("EXPLAIN $sql");
+    Execute("USE $db") if $db;
+
+    # Try to EXPLAIN the query, but catch errors for non-explainable queries
+    my @info;
+    my $explain_error = '';
+
+    # Clear any previous DBI errors
+    $dbh->{PrintError} = 0;
+
+    eval {
+# Enable ANSI_QUOTES mode temporarily for queries using double quotes as identifiers
+# This is common in Drupal and other frameworks
+        Execute("SET SESSION sql_mode = CONCAT(\@\@sql_mode, ',ANSI_QUOTES')");
+
+        @info = Hashes("EXPLAIN $sql");
+
+        # Restore previous sql_mode (remove ANSI_QUOTES)
+        Execute(
+            "SET SESSION sql_mode = REPLACE(\@\@sql_mode, ',ANSI_QUOTES', '')");
+
+        # Check if there was a DBI error even if no exception was thrown
+        if ( $dbh->err ) {
+            $explain_error = $dbh->errstr;
+        }
+    };
+
+    $explain_error = $@ if $@ && !$explain_error;
+
     print $CLEAR;
     print "EXPLAIN $sql:\n\n";
-    PrintTable(@info);
+
+    if ($explain_error) {
+        print RED() if $HAS_COLOR;
+        print "*** Error running EXPLAIN ***\n";
+        print "$explain_error\n";
+        print RESET() if $HAS_COLOR;
+        print "\nPossible issues:\n";
+        print
+"  - Query syntax error (check for missing spaces like 'DESCLIMIT' should be 'DESC LIMIT')\n";
+        print "  - Keywords run together due to whitespace normalization\n";
+        print
+"  - Double quotes used for identifiers (may need ANSI_QUOTES mode)\n";
+        print "  - Query type doesn't support EXPLAIN\n";
+        print "  - Database/table doesn't exist or no permissions\n";
+    }
+    elsif (@info) {
+        PrintTable(@info);
+    }
+    else {
+        print YELLOW() if $HAS_COLOR;
+        print
+          "*** No EXPLAIN output returned. Query may not be explainable. ***\n";
+        print RESET() if $HAS_COLOR;
+    }
 }
 
 ###########################################################################
 
-sub PrintTable(@)
-{
+sub PrintTable(@) {
     my $cnt = 1;
-    my @cols = qw(table type possible_keys key key_len ref rows Extra);
 
-    for my $row (@_)
-    {
+    # Include additional columns for MySQL 5.7+ and 8.0+
+    my @cols = qw(table type possible_keys key key_len ref rows filtered Extra);
+
+    for my $row (@_) {
         print "*** row $cnt ***\n";
-        for my $key (@cols)
-        {
+        for my $key (@cols) {
+
+            # Skip columns that don't exist in this result set
+            next unless exists $row->{$key};
+            my $val = $row->{$key} || 'NULL';
+            printf "%15s:  %s\n", $key, $val;
+        }
+
+        # Print any additional columns that weren't in our standard list
+        for my $key ( sort keys %$row ) {
+            next if grep { $_ eq $key } @cols;
             my $val = $row->{$key} || 'NULL';
             printf "%15s:  %s\n", $key, $val;
         }
@@ -1505,38 +1750,32 @@ sub PrintTable(@)
 
 ###########################################################################
 
-sub StringOrRegex($)
-{
+sub StringOrRegex($) {
     my $input = shift;
     chomp $input;
-    if (defined $input)
-    {
+    if ( defined $input ) {
+
         # regex, strip /.../ and use via qr//
-        if ($input =~ m{^/} and $input =~ m{/$})
-        {
+        if ( $input =~ m{^/} and $input =~ m{/$} ) {
             $input =~ s{^/}{} if $config{filter_user};
             $input =~ s{/$}{} if $config{filter_user};
-            $input =  qr/$input/;
+            $input = qr/$input/;
         }
 
-
         # reset to match anything
-        elsif ($input eq '')
-        {
+        elsif ( $input eq '' ) {
             $input = qr/.*/;
         }
 
         # string, build a simple regex
-        else
-        {
-            $input =  '^' . $input . '$';
+        else {
+            $input = '^' . $input . '$';
             $input = qr/$input/;
         }
     }
 
     # reset to match anything
-    else
-    {
+    else {
         $input = qr/.*/;
     }
     return $input;
@@ -1544,130 +1783,121 @@ sub StringOrRegex($)
 
 ###########################################################################
 
-sub cmd_l
-{
+sub cmd_l {
     ReadMode($RM_RESET);
 
     print RED(), "Seconds for long queries: ", RESET();
     my $secs = ReadLine(0);
 
-    if ($secs =~ /^\s*(\d+)/)
-    {
+    if ( $secs =~ /^\s*(\d+)/ ) {
         $config{long} = $1;
-        if ($config{long} < 1)
-        {
+        if ( $config{long} < 1 ) {
             $config{long} = 1;
         }
     }
     ReadMode($RM_NOBLKRD);
 }
 
-sub cmd_s
-{
+sub cmd_s {
     ReadMode($RM_RESET);
 
     print RED(), "Seconds of Delay: ", RESET();
     my $secs = ReadLine(0);
 
-    if ($secs =~ /^\s*(\d+)/)
-    {
+    if ( $secs =~ /^\s*(\d+)/ ) {
         $config{delay} = $1;
-        if ($config{delay} < 1)
-        {
+        if ( $config{delay} < 1 ) {
             $config{delay} = 1;
         }
     }
     ReadMode($RM_NOBLKRD);
 }
 
-sub cmd_S
-{
+sub cmd_S {
     ReadMode($RM_RESET);
 
     print RED(), "Seconds for Slow queries: ", RESET();
     my $secs = ReadLine(0);
 
-    if ($secs =~ /^\s*(\d+)/)
-    {
+    if ( $secs =~ /^\s*(\d+)/ ) {
         $config{slow} = $1;
-        if ($config{slow} < 1)
-        {
+        if ( $config{slow} < 1 ) {
             $config{slow} = 1;
         }
     }
     ReadMode($RM_NOBLKRD);
 }
 
-sub cmd_q
-{
+sub cmd_q {
     ReadMode($RM_RESET);
     print "\n";
     exit;
 }
 
-sub trim($)
-{
-	my $string = shift;
-	$string =~ s/^\s+//;
-	$string =~ s/\s+$//;
-	return $string;
+sub trim($) {
+    my $string = shift;
+    $string =~ s/^\s+//;
+    $string =~ s/\s+$//;
+    return $string;
 }
 
 ###########################################################################
 
-sub PrintHelp()
-{
+sub PrintHelp() {
     my $help = qq[
-Help for mytop version $main::VERSION by Jeremy D. Zawodny <${YELLOW}Jeremy\@Zawodny.com${RESET}>
- with updates by Mark Grennan <${YELLOW}mark\@grennan.com${RESET}>
 
-  ? - display this screen
-  # - toggle short/long numbers (not yet implemented)
-  c - command summary view (based on Com_* counters)
-  C - turn color on and off
-  d - show only a specific database
-  e - explain the query that a thread is running
-  E - display current replication error
-  f - show full query info for a given thread
-  F - unFilter the dispaly
-  h - show only a specifc host's connections
-  H - toggle the mytop header
-  i - toggle the display of idle (sleeping) threads
-  I - show innodb status
-  k - kill a thread
-  p - pause the display
-  l - change long running queries hightlighing
-  m - switch [mode] to qps (queries/sec) scrolling view
-  o - reverse the sort order (toggle)
-  q - quit
-  r - reset the status counters (via FLUSH STATUS on your server)
-  R - change reverse IP lookup
-  s - change the delay between screen updates
-  S - change slow quiery hightlighting
-  t - switch to thread view (default)
-  u - show only a specific user
-  : - enter a command (not yet implemented)
-  ! - Skip an error that has stopped replications (at your own risk)
+Help for mytop (version $main::VERSION):
 
-${GREEN}http://jeremy.zawodny.com/mysql/mytop/${RESET}
-${GREEN}http://www.mysqlfanboy.com/mytop/${RESET}
+    ? - Display help
+    ! - Force past a replication error (at your own risk)
+    c - Switch to command summary mode
+    C - Toggle color display on/off
+    d - Filter by specific database
+    E - Display current replication error
+    e - Explain a query by thread ID
+    F - Remove all filters
+    f - Show full query info for a thread
+    h - Filter by hostname
+    H - Toggle header display
+    i - Toggle idle (sleeping) thread display
+    I - Show InnoDB status
+    k - Kill a specific thread
+    K - Kill all threads owned by a specific user
+    l - Change long running query highlighting threshold
+    m - Switch to QPS (queries per second) mode
+    o - Reverse sort order
+    p - Pause display updates
+    q - Quit
+    r - Reset status counters (FLUSH STATUS)
+    R - Toggle reverse DNS lookup for IP addresses
+    s - Change refresh delay in seconds
+    S - Change slow query highlighting threshold
+    t - Filter by thread state
+    u - Filter by specific user
+    V - Show MySQL/MariaDB variables
+
+CREDITS
+- mytop was originally written by Jeremy Zawodny from 2000 and up to v1.7 (around 2009)
+- Mark Grennan took over from 2010 and up to v1.9.1.
+- As of February 2026, it's being maintained separately (as a fork) by Fotis Evangelou.
+
+Learn more at: ${GREEN}https://github.com/fevangelou/mytop${RESET}
+
 ];
 
     print $help;
 }
 
-sub Sum(@)
-{
+sub Sum(@) {
     my $sum;
-    while (my $val = shift @_) { $sum += $val; }
+    while ( my $val = shift @_ ) { $sum += $val; }
     return $sum;
 }
 
 ## A useful routine from perlfaq
 
-sub commify($)
-{
-    local $_  = shift;
+sub commify($) {
+    local $_ = shift;
     return 0 unless defined $_;
     1 while s/^([-+]?\d+)(\d{3})/$1,$2/;
     return $_;
@@ -1675,50 +1905,41 @@ sub commify($)
 
 ## Compact numeric representation (10,000 -> 10.0k)
 
-sub make_short($)
-{
+sub make_short($) {
     my $number = shift;
     return commify($number) if $config{long_nums};
     my $n = 0;
-    while ($number > 1_025) { $number /= 1024; $n++; };
-    return sprintf "%.1f%s", $number, ('','k','M','G', 'T')[$n];
+    while ( $number > 1_025 ) { $number /= 1024; $n++; }
+    return sprintf "%.1f%s", $number, ( '', 'k', 'M', 'G', 'T' )[$n];
 }
-
-
 
 ## Run a query and return the records has an array of hashes.
 
-sub Hashes($)
-{
+sub Hashes($) {
     my $sql = shift;
     my @records;
 
-    if (my $sth = Execute($sql))
-    {
-	while (my $ref = $sth->fetchrow_hashref)
-        {
+    if ( my $sth = Execute($sql) ) {
+        while ( my $ref = $sth->fetchrow_hashref ) {
             print "record\n" if $debug;
-	    push @records, $ref;
-	}
+            push @records, $ref;
+        }
     }
     return @records;
 }
 
 ## Execute an SQL query and return the statement handle.
 
-sub Execute($)
-{
+sub Execute($) {
     my $sql = shift;
     my $sth = $dbh->prepare($sql);
 
-    if (not $sth) { ReadMode($RM_RESET); die $DBI::errstr; }
+    if ( not $sth ) { ReadMode($RM_RESET); die $DBI::errstr; }
 
     my $ReturnCode = $sth->execute;
 
-    if (not $ReturnCode)
-    {
-        if ($debug)
-        {
+    if ( not $ReturnCode ) {
+        if ($debug) {
             print "query failed\n";
             sleep 10;
         }
@@ -1728,601 +1949,19 @@ sub Execute($)
     return $sth;
 }
 
-sub FindProg($)
-{
+sub FindProg($) {
     my $prog  = shift;
     my $found = undef;
-    my @search_dirs = ("/bin", "/usr/bin", "/usr/sbin",
-                       "/usr/local/bin", "/usr/local/sbin");
-
-    for (@search_dirs)
-    {
+    my @search_dirs =
+      ( "/bin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin" );
+    for (@search_dirs) {
         my $loc = "$_/$prog";
-        if (-e $loc)
-        {
+        if ( -e $loc ) {
             $found = $loc;
             last;
         }
     }
     return $found;
 }
-
-=pod
-
-=head1 SYNOPSIS
-
-B<mytop> [options]
-
-=head1 AVAILABILITY
-
-The latest version of B<mytop> is available from
-http://jeremy.zawodny.com/mysql/mytop/ it B<might> also be on CPAN as
-well.
-
-=head1 REQUIREMENTS
-
-In order for B<mytop> to function properly, you must have the
-following:
-
-  * Perl 5.005 or newer
-  * Getopt::Long
-  * DBI and DBD::mysql
-  * Term::ReadKey from CPAN
-
-Most systems are likely to have all of those installed--except for
-Term::ReadKey. You will need to pick that up from the CPAN. You can
-pick up Term::ReadKey here:
-
-    http://search.cpan.org/search?dist=TermReadKey
-
-And you obviously need access to a MySQL server (version 3.22.x or
-3.23.x) with the necessary security to run the I<SHOW PROCESSLIST> and
-I<SHOW STATUS> commands.
-
-If you are a Windows user, using ActiveState's Perl, you can use PPM
-(the Perl Package Manager) to install the MySQL and Term::ReadKey
-modules.
-
-=head2 Optional Color Support
-
-In additon, if you want a color B<mytop> (recommended), install
-Term::ANSIColor from the CPAN:
-
-    http://search.cpan.org/search?dist=ANSIColor
-
-Once you do, B<mytop> will automatically use it. However, color is not
-yet working on Windows. Patches welcome. :-)
-
-=head2 Optional Hi-Res Timing
-
-If you want B<mytop> to provide more accurate real-time
-queries-per-second statistics, install the Time::HiRes module from
-CPAN.  B<mytop> will automatically notice that you have it and use it
-rather than the standard timing mechanism.
-
-=head2 Platforms
-
-B<mytop> is known to work on:
-
-  * Linux (2.2.x, 2.4.x)
-  * FreeBSD (2.2, 3.x, 4.x)
-  * Mac OS X
-  * BSDI 4.x
-  * Solaris 2.x
-  * Windows NT 4.x (ActivePerl)
-
-If you find that it works on another platform, please let me
-know. Given that it is all Perl code, I expect it to be rather
-portable to Unix and Unix-like systems. Heck, it I<might> even work on
-Win32 systems.
-
-=head1 DESCRIPTION
-
-Help is always welcome in improving this software. Feel free to
-contact the author (see L<"AUTHOR"> below) with bug reports, fixes,
-suggestions, and comments. Additionally L<"BUGS"> will provide a list
-of things this software is not able to do yet.
-
-Having said that, here are the details on how it works and what you can
-do with it.
-
-=head2 The Basics
-
-B<mytop> was inspired by the system monitoring tool B<top>. I
-routinely use B<top> on Linux, FreeBSD, and Solaris. You are likely to
-notice features from each of them here.
-
-B<mytop> will connect to a MySQL server and periodically run the
-I<SHOW PROCESSLIST> and I<SHOW STATUS> commands and attempt to
-summarize the information from them in a useful format.
-
-=head2 The Display
-
-The B<mytop> display screen is really broken into two parts. The top 4
-lines (header) contain summary information about your MySQL
-server. For example, you might see something like:
-
-MySQL on localhost (4.0.13-log)                        up 1+11:13:00 [23:29:11]
- Queries: 19.3M  qps:  160 Slow:     1.0         Se/In/Up/De(%):    00/80/03/17
-             qps now:  219 Slow qps: 0.0  Threads:    1 (   1/  16) 00/74/00/25
- Key Efficiency: 99.3%  Bps in/out: 30.5k/162.8   Now in/out: 32.7k/ 3.3k
-
-The first line identifies the hostname of the server (localhost) and
-the version of MySQL it is running. The right had side shows the
-uptime of the MySQL server process in days+hours:minutes:seconds
-format (much like FreeBSD's top) as well as the current time.
-
-The second line displays the total number of queries the server has
-processed, the average number of queries per second, the number of
-slow queries, and the percentage of Select, Insert, Update, and Delete
-queries.
-
-The third real-time values. First is the number of queries per second,
-then the number of slow queries, followed by query precentages (like
-on the previous line).
-
-And the fourth line displays key buffer efficiency (how often keys are
-read from the buffer rather than disk) and the number of bytes that
-MySQL has sent and received, both over all and in the last cycle.
-
-You can toggle the header by hitting B<h> when running B<mytop>.
-
-The second part of the display lists as many threads as can fit on
-screen. By default they are sorted according to their idle time (least
-idle first). The display looks like:
-
-    Id     User       Host      Dbase   Time      Cmd Query or State
-    --     ----       ----      -----   ----      --- --------------
-    61  jzawodn  localhost      music      0    Query show processlist
-
-As you can see, the thread id, username, host from which the user is
-connecting, database to which the user is connected, number of seconds
-of idle time, the command the thread is executing, and the query info
-are all displayed.
-
-Often times the query info is what you are really interested in, so it
-is good to run B<mytop> in an xterm that is wider than the normal 80
-columns if possible.
-
-The thread display color-codes the threads if you have installed color
-support. The current color scheme only works well in a window with a
-dark (like black) background. The colors are selected according to the
-C<Command> column of the display:
-
-    Query   -  Yellow
-    Sleep   -  White
-    Connect -  Green
-    Slow    -  Bright
-    Long    -  Magenta
-
-Those are purely arbitrary and will be customizable in a future
-release. If they annoy you just start B<mytop> with the B<--nocolor>
-flag or adjust your config file appropriately.
-
-=head2 Arguments
-
-B<mytop> handles long and short command-line arguments. Not all
-options have both long and short formats, however. The long arguments
-have two dashes `--'. Short arguments only have one '-'.
-
-=over
-
-=item B<-u> or B<-user> username
-
-Username to use when logging in to the MySQL server. Default: ``root''.
-
-=item B<-p> or B<-pass> or B<-password> password
-
-Password to use when logging in to the MySQL server. Default: none.
-
-=item B<-h> or B<--host> hostname[:port]
-
-Hostname of the MySQL server. The hostname may be followed by an
-option port number. Note that the port is specified separate from the
-host when using a config file. Default: ``localhost''.
-
-=item B<--port> or B<-P> port
-
-If you're running MySQL on a non-standard port, use this to specify
-the port number. Default: 3306.
-
-=item B<-s> or B<--delay> seconds
-
-How long between display refreshes. Default: 5
-
-=item B<-d> or B<--db> or B<--database> database
-
-Use if you'd like B<mytop> to connect to a specific database by
-default. Default: ``test''.
-
-=item B<-b> or B<--batch> or B<--batchmode>
-
-In batch mode, mytop runs only once, does not clear the screen, and
-places no limit on the number of lines it will print. This is suitable
-for running periodically (perhaps from cron) to capture the
-information into a file for later viewing. You might use batch mode in
-a CGI script to occasionally display your MySQL server status on the
-web.
-
-Default: unset.
-
-=item B<-S> or B<--socket> /path/to/socket
-
-If you're running B<mytop> on the same host as MySQL, you may wish to
-have it use the MySQL socket directly rather than a standard TCP/IP
-connection. If you do,just specify one.
-
-Note that specifying a socket will make B<mytop> ignore any host
-and/or port that you might have specified. If the socket does not
-exist (or the file specified is not a socket), this option will be
-ignored and B<mytop> will use the hostname and port number instead.
-
-Default: none.
-
-=item B<--header> or B<--noheader>
-
-Sepcify if you want the header to display or not. You can toggle this
-with the B<h> key while B<mytop> is running.
-
-Default: header.
-
-=item B<--color> or B<--nocolor>
-
-Specify if you want a color display. This has no effect if you don't
-have color support available.
-
-Default: If you have color support, B<mytop> will try color unless you
-tell it not to.
-
-=item B<-i> or B<--idle> or B<--noi> or B<--noidle>
-
-Specify if you want idle (sleeping) threads to appear in the list. If
-sleeping threads are omitted, the default sorting order is reversed so
-that the longest running queries appear at the top of the list.
-
-Default: idle.
-
-=item B<--prompt> or B<--noprompt>
-
-Specify if you want to be prompted to type in your database password.
-This provides a little bit more security since it not only prevents
-the password from viewable in a process list, but also doesn't require
-the password to be stored in plain text in your ~/.mytop config file.
-You will B<only> be prompted if a password has not been specified in
-your config file or through another command line option.
-
-Default: noprompt.
-
-=item B<--resolve>
-
-If you have skip-resolve set on MySQL (to keep it from doing a reverse
-DNS lookup on each inbound connection), mytop can replace IP addresses
-with hostnames but toggling this option.
-
-Default: noresolve
-
-=back
-
-Command-line arguments will always take precedence over config file
-options. That happens because the config file is read I<BEFORE> the
-command-line arguments are applied.
-
-=head2 Config File
-
-Instead of always using bulky command-line parameters, you can also
-use a config file in your home directory (C<~/.mytop>). If present,
-B<mytop> will read it automatically. It is read I<before> any of your
-command-line arguments are processed, so your command-line arguments
-will override directives in the config file.
-
-Here is a sample config file C<~/.mytop> which implements the defaults
-described above.
-
-  user=root
-  pass=
-  host=localhost
-  db=test
-  delay=5
-  port=3306
-  slow=10
-  socket=
-  batchmode=0
-  header=1
-  color=1
-  idle=1
-  long=120
-
-Using a config file will help to ensure that your database password
-isn't visible to users on the command-line. Just make sure that the
-permissions on C<~/.mytop> are such that others cannot read it (unless
-you want them to, of course).
-
-You may have white space on either side of the C<=> in lines of the
-config file.
-
-=head2 Shortcut Keys
-
-The following keys perform various actions while B<mytop> is
-running. Those which have not been implemented are listed as
-such. They are included to give the user idea of what is coming.
-
-=over
-
-=item B<?>
-
-Display help.
-
-=item B<c>
-
-Show "command counters" based on the Com_* values in SHOW STATUS.
-This is a new feature.  Feedback welcome.
-
-=item B<C>
-
-Turn display color on and off. Default is on.
-
-=item B<d>
-
-Show only threads connected to a particular database.
-
-=item B<f>
-
-Given a thread id, display the entire query that thread was (and still
-may be) running.
-
-=item B<F>
-
-Disable all filtering (host, user, and db).
-
-=item B<h>
-
-Only show queries from a particular host.
-
-=item B<H>
-
-Toggle the header display. You can also specify either C<header=0> or
-C<header=1> in your config file to set the default behavior.
-
-=item B<i>
-
-Toggle the display of idle (sleeping) threads. If sleeping threads are
-filtered, the default sorting order is reversed so that the longest
-running queries appear at the top of the list.
-
-=item B<I>
-
-Switch to InnoDB Status mode.  The output of "SHOW INNODB STATUS" will
-be displayed every cycle.  In a future version, this may actually
-summarize that data rather than producing raw output.
-
-=item B<k>
-
-Kill a thread.
-
-=item B<m>
-
-Toggle modes. Currently this switches from `top' mode to `qps'
-(Queries Per Second Mode). In this mode, mytop will write out one
-integer per second. The number written reflects the number of queries
-executed by the server in the previous one second interval.
-
-More modes may be added in the future.
-
-=item B<o>
-
-Reverse the default sort order.
-
-=item B<p>
-
-Pause display.
-
-=item B<q>
-
-Quit B<mytop>
-
-=item B<r>
-
-Reset the server's status counters via a I<FLUSH STATUS> command.
-
-=item B<R>
-
-Togle IP reverse lookup. Default is on.
-
-=item B<s>
-
-Change the sleep time (number of seconds between display refreshes).
-
-=item B<S>
-
-Set the number of seconds a query will need to run before it is
-considered old and will be highlighted.
-
-=item B<u>
-
-Show only threads owned by a giver user.
-
-=back
-
-The B<s> key has a command-line counterpart: B<-s>.
-
-The B<h> key has two command-line counterparts: B<-header> and
-B<-noheader>.
-
-=head1 BUGS
-
-This is more of a BUGS + WishList.
-
-Some performance information is not available when talking to a
-version 3.22.x MySQL server. Additional information (about threads
-mostly) was added to the output of I<SHOW STATUS> in MySQL 3.23.x and
-B<mytop> makes use of it. If the information is not available, you
-will simply see zeros where the real numbers should be.
-
-Simply running this program will increase your overall counters (such
-as the number of queries run). But you may or may not view that as a
-bug.
-
-B<mytop> consumes too much CPU time when running (verified on older
-versions of Linux and FreeBSD). It's likely a problem related to
-Term::ReadKey. I haven't had time to investigate yet, so B<mytop> now
-automatically lowers its priority when you run it. You may also think
-about running B<mytop> on another workstation instead of your database
-server. However, C<mytop> on Solaris does B<not> have this problem.
-Newer versions of Linux and FreeBSD seem to have fixed this.
-
-You can't specify the maximum number of threads to list. If you have
-many threads and a tall xterm, B<mytop> will always try to display as
-many as it can fit.
-
-The size of most of the columns in the display has a small maximum
-width. If you have fairly long database/user/host names the display
-may appear odd. I have no good idea as to how best to deal with that
-yet. Suggestions are welcome.
-
-It'd be nice if you could just add B<mytop> configuration directives
-in your C<my.cnf> file instead of having a separate config file.
-
-You should be able to specify the columns you'd like to see in the
-display and the order in which they appear. If you only have one
-username that connects to your database, it's probably not worth
-having the User column appear, for example.
-
-=head1 AUTHOR
-
-mytop was developed and is maintained by Jeremy D. Zawodny
-(Jeremy@Zawodny.com).
-
-If you wish to e-mail me regarding this software, B<PLEASE> subscribe
-to the B<mytop> mailing list.  See the B<mytop> homepage for details.
-
-=head1 DISCLAIMER
-
-While I use this software in my job at Yahoo!, I am solely responsible
-for it. Yahoo! does not necessarily support this software in any
-way. It is merely a personal idea which happened to be very useful in
-my job.
-
-=head1 RECRUITING
-
-If you hack Perl and grok MySQL, come work at Yahoo! Contact me for
-details. Or just send me your resume. Er, unless we just had layoffs,
-in which case we're not hiring. :-(
-
-=head1 SEE ALSO
-
-Please check the MySQL manual if you're not sure where some of the
-output of B<mytop> is coming from.
-
-=head1 COPYRIGHT
-
-Copyright (C) 2000-2010, Jeremy D. Zawodny.
-
-=head1 CREDITS
-
-Fix a bug. Add a feature. See your name here!
-
-Many thanks go to these fine folks:
-
-=over
-
-=item Mark Grennan (mark@grennan.com) www.linuxfangoy.com
-
-Added updates for MySQL 5.x. Added 'S' (slow) highlighting.
-Added 'C' to turn on and off Color. Added 'l' command to change
-color for long running queries. Fixed a few documentation issues.
-Monitors Slave status. Added color to Queue hit ratio.
-Added number of rows sorted per second.
-Created release 1.7.
-
-=item Sami Ahlroos (sami@avis-net.de)
-
-Suggested the idle/noidle stuff.
-
-=item Jan Willamowius (jan@janhh.shnet.org)
-
-Mirnor bug report. Documentation fixes.
-
-=item Alex Osipov (alex@acky.net)
-
-Long command-line options, Unix socket support.
-
-=item Stephane Enten (tuf@grolier.fr)
-
-Suggested batch mode.
-
-=item Richard Ellerbrock (richarde@eskom.co.za)
-
-Bug reports and usability suggestions.
-
-=item William R. Mattil (wrm@newton.irngtx.tel.gte.com)
-
-Bug report about empty passwords not working.
-
-=item Benjamin Pflugmann (philemon@spin.de)
-
-Suggested -P command-line flag as well as other changes.
-
-=item Justin Mecham <justin@aspect.net>
-
-Suggested setting $0 to `mytop'.
-
-=item Thorsten Kunz <thorsten.kunz@de.tiscali.com>
-
-Provided a fix for cases when we try remove the domain name from the
-display even if it is actually an IP address.
-
-=item Sasha Pachev <sasha@mysql.com>
-
-Provided the idea of real-time queries per second in the main display.
-
-=item Paul DuBois <paul@snake.net>
-
-Pointed out some option-handling bugs.
-
-=item Mike Wexler <mwexler@tias.com>
-
-Suggested that we don't mangle (normalize) whitespace in query info by
-default.
-
-=item Mark Zweifel <markez@yahoo-inc.com>
-
-Make the --idle command-line argument negatable.
-
-=item Axel Schwenke <schwenke@jobpilot.de>
-
-Noticed the inccorect formula for query cache hit percentages in
-version 1.2.
-
-=item Steven Roussey <sroussey@network54.com>
-
-Supplied a patch to help filter binary junk in queries so that
-terminals don't freak out.
-
-=item jon r. luini <falcon@chime.com>
-
-Supplied a patch that formed the basis for C<-prompt> support.  Sean
-Leach <sleach@wiggum.com> submitted a similar patch.
-
-=item Yogish Baliga <baliga@yahoo-inc.com>
-
-Supplied a patch that formed the basis for C<-resolve> support.
-
-=item Per Andreas Buer <perbu@linpro.no>
-
-Supplied an excellent patch to tidy up the top display.  This includes
-showing most values in short form, such as 10k rather than 10000.
-
-=back
-
-See the Changes file on the B<mytop> distribution page for more
-details on what has changed.
-
-=head1 LICENSE
-
-B<mytop> is licensed under the GNU General Public License version
-2. For the full license information, please visit
-http://www.gnu.org/copyleft/gpl.html
-
-=cut
 
 __END__
