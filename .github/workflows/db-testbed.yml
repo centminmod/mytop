@@ -1,0 +1,52 @@
+# Grounded-truth regression testing for mytop, driven by the standalone
+# testbed/ directory at the repo root (docker topology + scripts; shared by
+# local dev and CI - single source of truth).
+#
+# ubuntu-latest ships Docker + Compose v2. Runner images build in CI
+# (~2-4 min first time per run; the cpanm DBD::MariaDB build is the slow part).
+name: db-testbed
+
+on:
+  push:
+    branches: [main, update-fork-v2.1]
+    paths:
+      - mytop
+      - testbed/**
+      - .github/workflows/db-testbed.yml
+  pull_request:
+    paths:
+      - mytop
+      - testbed/**
+      - .github/workflows/db-testbed.yml
+  workflow_dispatch:
+
+concurrency:
+  group: db-testbed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TESTBED: testbed/scripts/testbed.sh
+      COMPOSE_FILE_PATH: testbed/docker/compose.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Spin up full matrix (builds runner images, wires replica)
+        run: bash "$TESTBED" up full
+
+      - name: Grounded-truth verification suite
+        run: bash "$TESTBED" verify
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          bash "$TESTBED" status || true
+          docker compose -f "$COMPOSE_FILE_PATH" --profile full logs --tail 150 || true
+
+      - name: Destroy testbed
+        if: always()
+        run: bash "$TESTBED" destroy || true

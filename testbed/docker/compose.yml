@@ -1,0 +1,95 @@
+name: mytop-testbed
+
+# Grounded-truth DB matrix for mytop. Core services have no profile (always
+# started); the heavier replication/extra-version/fallback-driver services sit
+# behind the "full" profile. Repo is mounted read-only into runners at
+# /mytop-repo so code edits on the host are immediately testable.
+
+x-mysql-common: &mysql-healthcheck
+  test: ["CMD", "mysqladmin", "ping", "-uroot", "-prootpass"]
+  interval: 3s
+  timeout: 3s
+  retries: 20
+  start_period: 25s
+
+services:
+  mysql84:
+    image: mysql:8.4
+    container_name: mytop-mysql84
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    # native password ON: lets DBD::mysql 4.x connect over TCP without
+    # caching_sha2 RSA key exchange. GTID on so the replica can auto-position.
+    command: >-
+      --mysql-native-password=ON --server-id=1 --log-bin=mysql-bin
+      --gtid-mode=ON --enforce-gtid-consistency=ON
+    volumes:
+      - ./initdb-mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck: *mysql-healthcheck
+
+  mysql84-replica:
+    image: mysql:8.4
+    container_name: mytop-mysql84-replica
+    profiles: ["full", "replication"]
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    command: >-
+      --mysql-native-password=ON --server-id=2
+      --gtid-mode=ON --enforce-gtid-consistency=ON --read-only=ON
+    depends_on:
+      mysql84:
+        condition: service_healthy
+    healthcheck: *mysql-healthcheck
+    # CHANGE REPLICATION SOURCE is imperative post-boot work — done by
+    # scripts/setup-replica.sh, invoked automatically by `testbed.sh up full`.
+
+  mariadb11:
+    image: mariadb:11
+    container_name: mytop-mariadb11
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpass
+    command: --server-id=10 --log-bin
+    volumes:
+      - ./initdb-mariadb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  mariadb1011:
+    image: mariadb:10.11
+    container_name: mytop-mariadb1011
+    profiles: ["full"]
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpass
+    volumes:
+      - ./initdb-mariadb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  runner-mysql:
+    build:
+      context: .
+      dockerfile: runner-mysql.Dockerfile
+    image: mytop-runner-mysql:latest
+    container_name: mytop-runner-mysql
+    volumes:
+      - ../..:/mytop-repo:ro
+    command: sleep infinity
+
+  runner-mariadb:
+    build:
+      context: .
+      dockerfile: runner-mariadb.Dockerfile
+    image: mytop-runner-mariadb:latest
+    container_name: mytop-runner-mariadb
+    profiles: ["full"]
+    volumes:
+      - ../..:/mytop-repo:ro
+    command: sleep infinity
