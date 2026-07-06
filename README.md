@@ -4,7 +4,9 @@ A powerful MySQL and MariaDB monitoring tool for the command line, **mytop** dis
 
 
 ## Current Version
-**v2.1** - released on Jul 5th, 2026
+**v2.2** - released on Jul 6th, 2026
+
+This is the [centminmod/mytop](https://github.com/centminmod/mytop) fork - a fork of [fevangelou/mytop](https://github.com/fevangelou/mytop) (which modernized the original for MySQL 8.x & MariaDB 10.3+), which is itself a fork of Jeremy Zawodny's original mytop. v2.2 fixes regressions introduced in the v2.1 fork and adds modern-MySQL/MariaDB bug fixes, runtime-verified against MySQL 8.4 (+ a live replica) and MariaDB 10.11/11.8/12.3.
 
 ***See [CHANGELOG](#CHANGELOG) section for more info***
 
@@ -14,7 +16,7 @@ A powerful MySQL and MariaDB monitoring tool for the command line, **mytop** dis
 
 1. Download mytop directly into /usr/local/bin/ and make it executable
 ```bash
-curl -fsSL -o /usr/local/bin/mytop https://raw.githubusercontent.com/fevangelou/mytop/main/mytop && chmod +x /usr/local/bin/mytop
+curl -fsSL -o /usr/local/bin/mytop https://raw.githubusercontent.com/centminmod/mytop/main/mytop && chmod +x /usr/local/bin/mytop
 ```
 
 2. Run anywhere (the defaults work just fine on Debian 11+, Ubuntu 22.04+ and RHEL distros v7 or newer)
@@ -41,7 +43,33 @@ Sincere thanks to Jeremy D. Zawodny (original author) & Mark Grennan (who update
 
 ## WHAT'S NEW
 
+### v2.2 - centminmod fork: v2.1 regression & modern-MySQL/MariaDB fixes
+
+This fork picks up where the fevangelou v2.1 fork left off. Every fix below was reproduced and confirmed in Docker against **MySQL 8.4.10** (including a live 8.4 replica), **MariaDB 11.8**, **MariaDB 10.11** and **MariaDB 12.3**, exercised through both the `DBD::mysql` and `DBD::MariaDB` drivers.
+
+#### Critical: live "now" metrics restored
+- v2.1 dropped the `$last_time = $now_time` assignment in `GetData()` during its load-average refactor, leaving the per-interval time delta permanently `undef`
+- That silently blanked every real-time metric: **qps now**, **Slow qps**, **Sorts/sec**, **Hits/Ratio now** and **Now in/out**
+- Restored, so the live counters update again under load (before: blank, after: live values)
+
+#### Replication works on modern MySQL again
+- MySQL 8.0.22+ renamed the replica-status columns (`Source_*`, `Replica_*`, `Seconds_Behind_Source`); these are now mapped back onto the legacy keys the display uses, so the replication line renders on MySQL 8.x
+- The `SHOW REPLICA/SLAVE STATUS` probe is wrapped in `eval` so the 8.4-removed `SHOW SLAVE STATUS` (or a server-side-prepare failure) can no longer crash mytop - the line is simply omitted when it can't be read
+- Verified on an 8.4 replica: before = no line (and a hard crash under server-side prepare), after = `Replication IO:Yes SQL:Yes`
+
+#### Connection & version-detection fixes
+- Warns when `-P <port>` is silently dropped for host `localhost` (connections there always go via the local socket) and points you at `-h 127.0.0.1` to force TCP; stays silent on the default port 3306
+- MariaDB query-cache version gate now compares major/minor as integers - `"10.10"`/`"10.11"` previously numified to `10.1` and were wrongly treated as older than 10.6
+- MySQL major version is now parsed with a regex instead of `sprintf("%d", "8.4.10")`, which warned `isn't numeric` under `-w`
+
+#### Smaller fixes
+- `K` (kill all threads owned by a user) now matches the exact key instead of an unanchored `/K/` regex
+
+#### Testing & CI
+- Added a standalone Docker test matrix (`testbed/`) that boots MySQL 8.4 (plus a replica), MariaDB 10.11/11.8/12.3 and runs a regression suite through both drivers, wired into GitHub Actions so every change is verified against real servers
+
 ### MySQL 8.0 & MariaDB 10.3 (or newer) compatibility fixes
+*(from the fevangelou v2.0/v2.1 forks)*
 
 #### Query Cache Removal
 - MySQL 8.0 completely removed the query cache feature
@@ -133,7 +161,7 @@ No need to run `make` and `make install`, clone the repo, or fetch a tarball as 
 ```bash
 
 # 1. Download mytop directly into /usr/local/bin/ and make it executable
-curl -fsSL -o /usr/local/bin/mytop https://raw.githubusercontent.com/fevangelou/mytop/main/mytop && chmod +x /usr/local/bin/mytop
+curl -fsSL -o /usr/local/bin/mytop https://raw.githubusercontent.com/centminmod/mytop/main/mytop && chmod +x /usr/local/bin/mytop
 
 # 2. Run anywhere (the defaults work just fine on Debian 11+, Ubuntu 22.04+ and RHEL distros v7 or newer)
 mytop
@@ -280,6 +308,24 @@ mytop --batch
 ## CHANGELOG
 
 *This changelog also provides a historical record of all previous versions before 2.0.*
+
+### Version 2.2 - July 6th, 2026 (centminmod fork of fevangelou/mytop)
+
+Fixes for regressions introduced in the v2.1 fork plus modern MySQL/MariaDB bug fixes. Findings came from a multi-agent review and cross-model verification, and each was runtime-verified in Docker against MySQL 8.4.10 (including a live 8.4 replica), MariaDB 11.8, MariaDB 10.11 and MariaDB 12.3, through both `DBD::mysql` and `DBD::MariaDB`.
+
+1. **Critical - restored the per-interval time delta.** v2.1's load-average refactor dropped `$last_time = $now_time` in `GetData()`, leaving the time delta forever `undef` and silently blanking every real-time metric (`qps now`, `Slow qps`, `Sorts`, `Hits/Ratio now`, `Now in/out`). Restored - the live counters populate again under load.
+
+2. **Replication renders on MySQL 8.0.22+.** The renamed status columns (`Source_*`/`Replica_*`/`Seconds_Behind_Source`) are normalized onto the legacy keys the display uses. The `REPLICA`/`SLAVE` probe is now wrapped in `eval`, so the `SHOW SLAVE STATUS` statement removed in MySQL 8.4 (or a server-side-prepare failure) can no longer crash mytop - replication status is simply omitted when it can't be read.
+
+3. **`-P <port>` warning for `localhost`.** Connecting to host `localhost` always uses the local socket, so a non-default `-P` is silently ignored. mytop now warns and suggests `-h 127.0.0.1` to force a TCP connection; it stays silent on the default port 3306.
+
+4. **MariaDB query-cache version gate fixed.** The gate now compares major/minor version numbers as integers - a naive numeric comparison turned `"10.10"`/`"10.11"` into `10.1`, wrongly classifying them as older than 10.6 (where the query cache was removed).
+
+5. **MySQL major-version parse under `-w`.** The major version is now extracted with a regex instead of `sprintf("%d", "8.4.10")`, which emitted an `isn't numeric` warning under `-w`.
+
+6. **`K` key match tightened.** The "kill all threads owned by a user" command now matches the exact key rather than an unanchored `/K/` regex.
+
+7. **Docker test matrix + CI.** Added a standalone `testbed/` that boots MySQL 8.4 (plus a replica) and MariaDB 10.11/11.8/12.3 and runs a regression suite through both drivers, wired into GitHub Actions.
 
 ### Version 2.1 - July 5th, 2026
 1. Dual DBD driver support added.
@@ -451,7 +497,8 @@ GNU General Public License
 - **Mark Grennan** - MySQL 5.x updates and enhancements (2010-2012)
   - https://www.mysqlfanboy.com/mytop-3/
 - **Fotis Evangelou (vibe coded with Claude)** - Updated to support MySQL 8.0 & MariaDB 10.3 or newer releases (2026+)
+- **George Liu (centminmod)** - v2.2 fork: v2.1 regression fixes and modern MySQL 8.4 / MariaDB 10.11-12.3 bug fixes, runtime-verified in Docker (2026+)
 
 ---
 
-**mytop v2.1** - Keeping a classic MySQL/MariaDB monitoring tool alive for modern database versions.
+**mytop v2.2** - Keeping a classic MySQL/MariaDB monitoring tool alive for modern database versions.

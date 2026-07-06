@@ -1,15 +1,36 @@
 #!/usr/bin/perl -w
 
 # /**
-#  * @version    2.1
+#  * @version    2.2
 #  * @package    mytop
-#  * @author     Fotis Evangelou - originally by Jeremy Zawodny & Mark Grennan
-#  * @url        https://github.com/fevangelou/mytop
-#  * @copyright  Copyright (c) 2000 - 2007 Jeremy D. Zawodny, (c) 2010 - 2025 Mark Grennan, (c) 2026+ Fotis Evangelou
+#  * @author     George Liu (centminmod) - fork of Fotis Evangelou's mytop, originally by Jeremy Zawodny & Mark Grennan
+#  * @url        https://github.com/centminmod/mytop
+#  * @fork-of    https://github.com/fevangelou/mytop
+#  * @copyright  Copyright (c) 2000 - 2007 Jeremy D. Zawodny, (c) 2010 - 2025 Mark Grennan, (c) 2026 Fotis Evangelou, (c) 2026+ George Liu (centminmod)
 #  * @license    GNU/GPL
 #  */
 
 # --- CHANGELOG ---
+# v2.2 - Jul 6th, 2026 (centminmod fork of fevangelou/mytop):
+# - CRITICAL: restore the per-interval time delta in GetData() - v2.1 dropped
+#   "$last_time = $now_time" in its load-avg refactor, leaving $t_delta forever
+#   undef and silently blanking every "now" metric (qps now, Slow qps, Sorts,
+#   Hits/Ratio now, Now in/out)
+# - Replication now renders on MySQL 8.0.22+ by mapping the renamed Source_*/
+#   Replica_*/Seconds_Behind_Source columns back onto the legacy keys, and the
+#   REPLICA/SLAVE probe is wrapped in eval so the 8.4-removed SHOW SLAVE STATUS
+#   (or a server-side-prepare failure) can no longer crash mytop
+# - Warn when "-P <port>" is silently dropped for host "localhost" (suggest
+#   127.0.0.1 to force a TCP connection); silent on the default port 3306
+# - MariaDB query-cache version gate now compares major/minor as integers, so
+#   "10.10"/"10.11" no longer numify to 10.1 and wrongly test as < 10.6
+# - MySQL major-version is parsed via regex instead of sprintf("%d", ...),
+#   which warned "isn't numeric" under -w on versions like "8.4.10"
+# - "K" (kill all threads by user) now matches the exact key instead of an
+#   unanchored /K/ regex
+# - Runtime-verified in Docker against MySQL 8.4 (incl. a live 8.4 replica),
+#   MariaDB 10.11/11.8/12.3, via both DBD::mysql and DBD::MariaDB
+#
 # v2.1 - Jul 5th, 2026:
 # - Dual DBD driver support: use DBD::mysql if present, fall back to DBD::MariaDB
 #   (fixes systems using MariaDB.org/cPanel repos on RHEL 9+, where perl-DBD-MySQL's
@@ -148,7 +169,7 @@ BEGIN {
 use Getopt::Long;
 use Socket;
 
-$main::VERSION = "2.1";
+$main::VERSION = "2.2";
 
 $| = 1;
 $0 = 'mytop';
@@ -1933,7 +1954,7 @@ CREDITS
 - Mark Grennan took over from 2010 and up to v1.9.1.
 - As of February 2026, it's being maintained separately (as a fork) by Fotis Evangelou.
 
-Learn more at: ${GREEN}https://github.com/fevangelou/mytop${RESET}
+Learn more at: ${GREEN}https://github.com/centminmod/mytop${RESET}
 
 ];
 
