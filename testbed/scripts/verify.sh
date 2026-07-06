@@ -35,7 +35,7 @@ grep -q 'db_release > 10' "$REPO/mytop" \
 if up runner-mysql; then
   xr "perl -c $MYTOP" >/dev/null 2>&1 \
     && ok "perl -c (DBD::mysql runner)" || bad "perl -c (DBD::mysql runner)"
-  for t in mysql84 mysql84-replica mariadb11 mariadb1011; do
+  for t in mysql84 mysql84-replica mariadb11 mariadb1011 mariadb123; do
     if up "$t"; then
       xr "perl $MYTOP -h $t -u mon -pmonpass -d mysql -b >/dev/null 2>&1" \
         && ok "batch run vs $t exits 0" || bad "batch run vs $t"
@@ -48,6 +48,14 @@ if up runner-mysql; then
     [ "${n:-1}" -eq 0 ] && ok "no 'isn't numeric' warning (version parse fix)" \
                         || bad "'isn't numeric' warning returned"
   fi
+
+  # MariaDB 12.x: first major past the "10.6+" gate fix — the version string
+  # (e.g. 12.3.x-MariaDB) must parse clean and take the modern-variables path
+  if up mariadb123; then
+    n=$(xr "perl $MYTOP -h mariadb123 -u mon -pmonpass -d mysql -b 2>&1 | grep -c \"isn't numeric\"")
+    [ "${n:-1}" -eq 0 ] && ok "no 'isn't numeric' warning on MariaDB 12.3" \
+                        || bad "'isn't numeric' warning on MariaDB 12.3"
+  else skip "MariaDB 12.3 version-parse check (service not up)"; fi
 
   # fix #5: localhost + non-default port warns
   w=$(xr "perl $MYTOP -h localhost -P 3307 -u mon -pmonpass -b 2>&1 | grep -c 'ignored for host'" || true)
@@ -79,6 +87,11 @@ if up runner-mariadb; then
     xrm "perl $MYTOP -h mariadb11 -u mon -pmonpass -d mysql -b >/dev/null 2>&1" \
       && ok "DBD::MariaDB fallback driver vs mariadb11" \
       || bad "DBD::MariaDB fallback driver vs mariadb11"
+  fi
+  if up mariadb123; then
+    xrm "perl $MYTOP -h mariadb123 -u mon -pmonpass -d mysql -b >/dev/null 2>&1" \
+      && ok "DBD::MariaDB fallback driver vs mariadb123" \
+      || bad "DBD::MariaDB fallback driver vs mariadb123"
   fi
 else
   skip "DBD::MariaDB fallback checks (runner-mariadb not up; use 'up full')"

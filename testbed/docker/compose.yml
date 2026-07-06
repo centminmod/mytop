@@ -73,6 +73,21 @@ services:
       retries: 20
       start_period: 20s
 
+  mariadb123:
+    image: mariadb:12.3
+    container_name: mytop-mariadb123
+    profiles: ["full"]
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpass
+    volumes:
+      - ./initdb-mariadb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
   runner-mysql:
     build:
       context: .
