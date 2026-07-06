@@ -1952,7 +1952,8 @@ Help for mytop (version $main::VERSION):
 CREDITS
 - mytop was originally written by Jeremy Zawodny from 2000 and up to v1.7 (around 2009)
 - Mark Grennan took over from 2010 and up to v1.9.1.
-- As of February 2026, it's being maintained separately (as a fork) by Fotis Evangelou.
+- As of February 2026, it was maintained separately (as a fork) by Fotis Evangelou.
+- As of July 2026, this fork of Fotis Evangelou's mytop is maintained by George Liu (centminmod).
 
 Learn more at: ${GREEN}https://github.com/centminmod/mytop${RESET}
 
