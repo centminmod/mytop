@@ -354,6 +354,12 @@ elsif ( lc( $config{host} ) eq 'localhost' ) {
     ## (unlike DBD::mysql, which just silently ignores it) rejects the DSN
     ## outright with "port cannot be specified when host is localhost or
     ## embedded". Omit the port here and let the driver find the default socket.
+    ## If the user explicitly asked for a non-default TCP port, warn them it is
+    ## being ignored for "localhost" and that 127.0.0.1 forces a TCP connection.
+    if ( defined $config{port} && $config{port} != 3306 ) {
+        warn "NOTE: -P $config{port} is ignored for host 'localhost' "
+          . "(connects via local socket). Use -h 127.0.0.1 to force TCP.\n";
+    }
     $dsn .= "host=$config{host}";
 }
 else {
@@ -409,6 +415,7 @@ my $db_version;
 my $db_release;
 my $is_mariadb = 0;
 my $mariadb_version;
+my $mariadb_minor;
 my $have_query_cache;
 
 my @variables = Hashes("show variables");
@@ -425,11 +432,13 @@ foreach (@variables) {
             if ( $db_version =~ /^(\d+)\.(\d+)/ ) {
                 $mariadb_version = "$1.$2";
                 $db_release      = $1;        # Major version
+                $mariadb_minor   = $2;        # Minor version (integer)
             }
         }
         else {
-            # MySQL version
-            $db_release = int( sprintf( "%d", $db_version ) );
+            # MySQL version (e.g. "8.4.10" -> 8). Parse the leading integer with
+            # a regex; sprintf("%d", "8.4.10") warns "isn't numeric" under -w.
+            ($db_release) = $db_version =~ /^(\d+)/;
         }
 
         # Strip any "-MariaDB"/"-log"/etc. build suffix for display purposes
@@ -459,8 +468,13 @@ if ( !defined $have_query_cache ) {
     # Query cache variable doesn't exist, check if it was removed
     if ($is_mariadb) {
 
-        # MariaDB 10.6+ removed query cache
-        if ( $mariadb_version && $mariadb_version >= 10.6 ) {
+        # MariaDB 10.6+ removed query cache. Compare major/minor as integers -
+        # a naive `$mariadb_version >= 10.6` numifies "10.10"/"10.11" to 10.1
+        # and wrongly reports them as < 10.6.
+        if ( defined $db_release
+            && ( $db_release > 10
+                || ( $db_release == 10 && ( $mariadb_minor // 0 ) >= 6 ) ) )
+        {
             $have_query_cache = 0;
         }
         else {
@@ -783,7 +797,7 @@ while (1) {
     }
 
     ## K - kill based on a username
-    if ( $key =~ /K/ ) {
+    if ( $key eq 'K' ) {
         ReadMode($RM_RESET);
 
         print RED(), "User to kill: ", RESET();
@@ -947,6 +961,12 @@ sub GetData() {
         if ( $last_time and $last_time != $now_time ) {
             $t_delta = $now_time - $last_time;
         }
+
+        ## Remember this sample's timestamp so the next GetData() can compute a
+        ## per-interval delta. Dropping this assignment (as v2.1 did during the
+        ## load-avg refactor) leaves $t_delta forever undef, silently killing the
+        ## "qps now / Slow qps / Sorts", "Hits/Ratio now" and "Now in/out" metrics.
+        $last_time = $now_time;
 
         %OLD_STATUS = %STATUS;
 
@@ -1214,11 +1234,43 @@ sub GetData() {
             print RESET() if ($HAS_COLOR);
         }
 
-        # Try REPLICA first (modern syntax), fall back to SLAVE
-        my ($slave_data) = Hashes('SHOW REPLICA STATUS');
-        if ( !$slave_data || !exists $slave_data->{Master_Host} ) {
-            ($slave_data) = Hashes('SHOW SLAVE STATUS');
-        }
+        # MySQL 8.0.22+ renamed the replica-status columns (Source_*/Replica_*/
+        # Seconds_Behind_Source). Map the modern names back onto the legacy keys
+        # the display code below uses, so replication status still renders on
+        # MySQL 8.x. Only copy when the modern key is defined, so we never
+        # autovivify Master_Host (which would defeat the fallback's exists check).
+        my $normalize_replica = sub {
+            my $d = shift or return;
+            $d->{Master_Host} = $d->{Source_Host}
+              if !defined $d->{Master_Host} && defined $d->{Source_Host};
+            $d->{Slave_IO_Running} = $d->{Replica_IO_Running}
+              if !defined $d->{Slave_IO_Running}
+              && defined $d->{Replica_IO_Running};
+            $d->{Slave_SQL_Running} = $d->{Replica_SQL_Running}
+              if !defined $d->{Slave_SQL_Running}
+              && defined $d->{Replica_SQL_Running};
+            $d->{Seconds_Behind_Master} = $d->{Seconds_Behind_Source}
+              if !defined $d->{Seconds_Behind_Master}
+              && defined $d->{Seconds_Behind_Source};
+            $d->{Last_Error} = $d->{Last_Error_Message}
+              if !defined $d->{Last_Error}
+              && defined $d->{Last_Error_Message};
+        };
+
+        # Try REPLICA first (modern syntax), fall back to SLAVE. Wrapped in eval
+        # so a removed statement (SHOW SLAVE STATUS is gone in MySQL 8.4+) or a
+        # prepare-time syntax error can't crash mytop - replication status is
+        # simply omitted when it can't be read.
+        my ($slave_data);
+        eval {
+            ($slave_data) = Hashes('SHOW REPLICA STATUS');
+            $normalize_replica->($slave_data);
+            if ( !$slave_data || !exists $slave_data->{Master_Host} ) {
+                ($slave_data) = Hashes('SHOW SLAVE STATUS');
+                $normalize_replica->($slave_data);
+            }
+            1;
+        } or do { $slave_data = undef };
 
         if ( $slave_data && defined( $slave_data->{Master_Host} ) ) {
             if ( defined( $slave_data->{Seconds_Behind_Master} ) ) {
